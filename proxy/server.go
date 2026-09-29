@@ -9,7 +9,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path"
@@ -28,7 +30,7 @@ type ServerOps interface {
 	NewContext(r *http.Request) (context.Context, error)
 	// List, Latest, Info, GoMod, and Zip all return a File to be sent to a client.
 	// The File will be closed after its contents are sent.
-	// In the case of an error, if the error satisfies errors.Is(err, os.ErrNotFound),
+	// In the case of an error, if the error satisfies errors.Is(err, os.ErrNotExist),
 	// the server responds with an HTTP 404 error;
 	// otherwise it responds with an HTTP 500 error.
 	// List returns a list of tagged versions of the module identified by path.
@@ -193,7 +195,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if openErr != nil {
-		code := http.StatusNotFound
+		code := http.StatusInternalServerError
+		if errors.Is(openErr, fs.ErrNotExist) {
+			code = http.StatusNotFound
+		}
 		http.Error(w, openErr.Error(), code)
 		return
 	}

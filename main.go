@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/goproxyio/goproxy/v2/proxy"
+	"github.com/goproxyio/goproxy/v2/renameio"
 	"github.com/goproxyio/goproxy/v2/sumdb"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -225,7 +226,7 @@ func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
 		log.Printf("make cache dir failed, err: %v.", err)
 		return nil, err
 	}
-	if err := os.WriteFile(file, data, 0666); err != nil {
+	if err := renameio.WriteFile(file, data, 0666); err != nil {
 		return nil, err
 	}
 
