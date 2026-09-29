@@ -29,7 +29,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -110,7 +112,12 @@ func main() {
 		handle = &logger{proxy.NewServer(new(ops))}
 	}
 
-	server := &http.Server{Addr: listen, Handler: handle}
+	server := &http.Server{
+		Addr:              listen,
+		Handler:           handle,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
 			if err != http.ErrServerClosed {
@@ -174,6 +181,8 @@ func mapNotFound(err error) error {
 
 // goJSON runs the go command and parses its JSON output into dst.
 func goJSON(dst any, command ...string) error {
+	goCmdSem <- struct{}{}
+	defer func() { <-goCmdSem }()
 	cmd := exec.Command(command[0], command[1:]...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -227,38 +236,49 @@ func (*ops) NewContext(r *http.Request) (context.Context, error) {
 
 // List lists proxy files.
 func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
-	escMod, err := module.EscapePath(mpath)
-	if err != nil {
-		return nil, err
-	}
-	file := filepath.Join(downloadRoot, escMod, "@v", "list")
+	file := listPath(mpath)
 	if info, err := os.Stat(file); err == nil && time.Since(info.ModTime()) < cacheExpire {
 		return os.Open(file)
 	}
-	var list struct {
-		Path     string
-		Versions []string
-	}
-	if err := goJSON(&list, "go", "list", "-m", "-json", "-versions", mpath+"@latest"); err != nil {
-		return nil, err
-	}
-	if list.Path != mpath {
-		return nil, fmt.Errorf("go list -m: asked for %s but got %s", mpath, list.Path)
-	}
-	data := []byte(strings.Join(list.Versions, "\n") + "\n")
-	if len(data) == 1 {
-		data = nil
-	}
-	err = os.MkdirAll(filepath.Dir(file), os.ModePerm)
+	data, err := fetchList(mpath)
 	if err != nil {
-		log.Printf("make cache dir failed, err: %v.", err)
 		return nil, err
 	}
-	if err := renameio.WriteFile(file, data, 0666); err != nil {
-		return nil, err
-	}
+	return proxy.MemFile(data, time.Now()), nil
+}
 
-	return os.Open(file)
+// fetchList resolves the version list for mpath, merging concurrent requests
+// for the same module into one go command run.
+func fetchList(mpath string) ([]byte, error) {
+	v, err := doOnce("list:"+mpath, func() (any, error) {
+		var list struct {
+			Path     string
+			Versions []string
+		}
+		if err := goJSON(&list, "go", "list", "-m", "-json", "-versions", mpath+"@latest"); err != nil {
+			return nil, err
+		}
+		if list.Path != mpath {
+			return nil, fmt.Errorf("go list -m: asked for %s but got %s", mpath, list.Path)
+		}
+		data := []byte(strings.Join(list.Versions, "\n") + "\n")
+		if len(data) == 1 {
+			data = nil
+		}
+		file := listPath(mpath)
+		if err := os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
+			log.Printf("make cache dir failed, err: %v.", err)
+			return nil, err
+		}
+		if err := renameio.WriteFile(file, data, 0666); err != nil {
+			return nil, err
+		}
+		return data, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]byte), nil
 }
 
 // Latest fetches latest file.
@@ -272,6 +292,9 @@ func (*ops) Latest(ctx context.Context, path string) (proxy.File, error) {
 
 // Info fetches info file.
 func (*ops) Info(ctx context.Context, m module.Version) (proxy.File, error) {
+	if f, err := cachedFile(m, ".info"); err == nil {
+		return f, nil
+	}
 	d, err := download(m)
 	if err != nil {
 		return nil, err
@@ -281,6 +304,9 @@ func (*ops) Info(ctx context.Context, m module.Version) (proxy.File, error) {
 
 // GoMod fetches go mod file.
 func (*ops) GoMod(ctx context.Context, m module.Version) (proxy.File, error) {
+	if f, err := cachedFile(m, ".mod"); err == nil {
+		return f, nil
+	}
 	d, err := download(m)
 	if err != nil {
 		return nil, err
@@ -290,6 +316,9 @@ func (*ops) GoMod(ctx context.Context, m module.Version) (proxy.File, error) {
 
 // Zip fetches zip file.
 func (*ops) Zip(ctx context.Context, m module.Version) (proxy.File, error) {
+	if f, err := cachedFile(m, ".zip"); err == nil {
+		return f, nil
+	}
 	d, err := download(m)
 	if err != nil {
 		return nil, err
@@ -308,7 +337,70 @@ type downloadInfo struct {
 	GoModSum string
 }
 
+// cachedFile opens the module's download cache file with the given extension,
+// so repeated requests never spawn a go command.
+func cachedFile(m module.Version, ext string) (proxy.File, error) {
+	escMod, err := module.EscapePath(m.Path)
+	if err != nil {
+		return nil, err
+	}
+	escVer, err := module.EscapeVersion(m.Version)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(filepath.Join(downloadRoot, escMod, "@v", escVer+ext))
+}
+
+// listPath returns the download cache list file path for a module.
+func listPath(mpath string) string {
+	escMod, _ := module.EscapePath(mpath)
+	return filepath.Join(downloadRoot, escMod, "@v", "list")
+}
+
+// goCmdSem bounds concurrent go command subprocesses so a cold-cache
+// request storm cannot spawn hundreds of simultaneous git clones.
+var goCmdSem = make(chan struct{}, 2*runtime.NumCPU())
+
+// flights merges concurrent fetches of the same key into one run.
+var flights = struct {
+	sync.Mutex
+	m map[string]*flight
+}{m: map[string]*flight{}}
+
+type flight struct {
+	wg  sync.WaitGroup
+	val any
+	err error
+}
+
+// doOnce runs f once per concurrent call with the same key and shares its
+// result with all waiting callers.
+func doOnce(key string, f func() (any, error)) (any, error) {
+	flights.Lock()
+	if fl, ok := flights.m[key]; ok {
+		flights.Unlock()
+		fl.wg.Wait()
+		return fl.val, fl.err
+	}
+	fl := &flight{}
+	fl.wg.Add(1)
+	flights.m[key] = fl
+	flights.Unlock()
+	fl.val, fl.err = f()
+	flights.Lock()
+	delete(flights.m, key)
+	flights.Unlock()
+	fl.wg.Done()
+	return fl.val, fl.err
+}
+
 func download(m module.Version) (*downloadInfo, error) {
-	d := new(downloadInfo)
-	return d, goJSON(d, "go", "mod", "download", "-json", m.String())
+	v, err := doOnce(m.String(), func() (any, error) {
+		d := new(downloadInfo)
+		return d, goJSON(d, "go", "mod", "download", "-json", m.String())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*downloadInfo), nil
 }

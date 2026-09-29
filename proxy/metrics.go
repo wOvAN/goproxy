@@ -1,8 +1,9 @@
 package proxy
 
 import (
-	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -25,10 +26,6 @@ type metricsResponseWriter struct {
 	statusCode int
 }
 
-func (mw metricsResponseWriter) status() string {
-	return fmt.Sprintf("%d", mw.statusCode)
-}
-
 // NewMetricsResponseWriter creates custom metrics response writer.
 func NewMetricsResponseWriter(w http.ResponseWriter) *metricsResponseWriter {
 	// WriteHeader(int) is not called if our response implicitly returns 0, so
@@ -40,4 +37,29 @@ func NewMetricsResponseWriter(w http.ResponseWriter) *metricsResponseWriter {
 func (mw *metricsResponseWriter) WriteHeader(code int) {
 	mw.statusCode = code
 	mw.ResponseWriter.WriteHeader(code)
+}
+
+// status returns the status code label.
+func (mw *metricsResponseWriter) status() string {
+	return strconv.Itoa(mw.statusCode)
+}
+
+// ReadFrom forwards to the underlying writer to keep the sendfile fast path.
+func (mw *metricsResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := mw.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(mw.ResponseWriter, r)
+}
+
+// Flush implements http.Flusher to keep reverse proxy streaming.
+func (mw *metricsResponseWriter) Flush() {
+	if f, ok := mw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap exposes the underlying ResponseWriter to net/http.
+func (mw *metricsResponseWriter) Unwrap() http.ResponseWriter {
+	return mw.ResponseWriter
 }

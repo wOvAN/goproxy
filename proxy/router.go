@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"compress/gzip"
 	"crypto/tls"
 	"fmt"
@@ -13,13 +12,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/goproxyio/goproxy/v2/renameio"
 	"github.com/goproxyio/goproxy/v2/sumdb"
-
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 // ListExpire list data expire data duration.
@@ -79,35 +77,53 @@ func (router *Router) customModResponse(r *http.Response) error {
 	return nil
 }
 
+// cacheResponseBody streams the response body into the download cache, then
+// replaces the response body with the cached file so the client is served from
+// the same stream. The body is never fully buffered in memory.
 func cacheResponseBody(resp *http.Response, file string) error {
-	var buf []byte
-	if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
+	var src io.Reader = resp.Body
+	compressed := strings.Contains(resp.Header.Get("Content-Encoding"), "gzip")
+	if compressed {
 		gr, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = gr.Close() }()
-		buf, err = io.ReadAll(gr)
-		if err != nil {
-			return err
-		}
-		resp.Header.Del("Content-Encoding")
-		resp.Header.Set("Content-Length", fmt.Sprint(len(buf)))
-	} else {
-		var err error
-		buf, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
+		src = gr
 	}
-	resp.Body = io.NopCloser(bytes.NewReader(buf))
-	if buf != nil {
-		if err := os.MkdirAll(filepath.ToSlash(filepath.Dir(file)), os.ModePerm); err != nil {
-			return err
-		}
-		return renameio.WriteFile(file, buf, 0666)
+	cr := &countReader{r: src}
+	if err := os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
+		return err
+	}
+	if err := renameio.WriteToFile(file, cr, 0666); err != nil {
+		return err
+	}
+	// The original body is fully consumed; release its connection before
+	// replacing it with the cached file.
+	_ = resp.Body.Close()
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	resp.Body = f
+	if compressed {
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Set("Content-Length", strconv.FormatInt(cr.n, 10))
 	}
 	return nil
+}
+
+// countReader reads from r while counting the bytes read.
+type countReader struct {
+	r io.Reader
+	n int64
+}
+
+// Read implements io.Reader.
+func (c *countReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // NewRouter returns a new Router using the given operations.
@@ -135,11 +151,12 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 
 		rt.proxy = proxy
 
-		rt.proxy.Transport = &http.Transport{
-			Proxy:           http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
 		rt.proxy.ModifyResponse = rt.customModResponse
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		transport.MaxIdleConnsPerHost = 100
+		transport.ResponseHeaderTimeout = 30 * time.Second
+		rt.proxy.Transport = transport
 		rt.pattern = opts.Pattern
 		rt.downloadRoot = opts.DownloadRoot
 		rt.cacheExpire = opts.CacheExpire
@@ -155,20 +172,26 @@ func (rt *Router) Direct(path string) bool {
 	return GlobsMatchPath(rt.pattern, path)
 }
 
+// count increments the request counter. WithLabelValues avoids the
+// prometheus.Labels map allocation on the hot path.
+func (rt *Router) count(mode string, mw *metricsResponseWriter) {
+	totalRequest.WithLabelValues(mode, mw.status()).Inc()
+}
+
 // ServveHTTP implements http handler.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mw := NewMetricsResponseWriter(w)
 	// sumdb handler
 	if strings.HasPrefix(r.URL.Path, "/sumdb/") {
 		sumdb.Handler(mw, r)
-		totalRequest.With(prometheus.Labels{"mode": "sumdb", "status": mw.status()}).Inc()
+		rt.count("sumdb", mw)
 		return
 	}
 
 	if rt.proxy == nil || rt.Direct(strings.TrimPrefix(r.URL.Path, "/")) {
 		log.Printf("------ --- %s [direct]\n", r.URL)
 		rt.srv.ServeHTTP(mw, r)
-		totalRequest.With(prometheus.Labels{"mode": "direct", "status": mw.status()}).Inc()
+		rt.count("direct", mw)
 		return
 	}
 
@@ -181,13 +204,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if time.Since(info.ModTime()) >= ListExpire {
 					log.Printf("------ --- %s [proxy]\n", r.URL)
 					rt.proxy.ServeHTTP(mw, r)
-					totalRequest.With(prometheus.Labels{"mode": "proxy", "status": mw.status()}).Inc()
+					rt.count("proxy", mw)
 				} else {
 					ctype = "text/plain; charset=UTF-8"
 					mw.Header().Set("Content-Type", ctype)
-					log.Printf("------ --- %s [cached]\n", r.URL)
 					http.ServeContent(mw, r, "", info.ModTime(), f)
-					totalRequest.With(prometheus.Labels{"mode": "cached", "status": mw.status()}).Inc()
+					rt.count("cached", mw)
 				}
 				return
 			}
@@ -195,7 +217,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			i := strings.Index(r.URL.Path, "/@v/")
 			if i < 0 {
 				http.Error(mw, "no such path", http.StatusNotFound)
-				totalRequest.With(prometheus.Labels{"mode": "cached", "status": mw.status()}).Inc()
+				rt.count("cached", mw)
 				return
 			}
 
@@ -204,7 +226,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if time.Since(info.ModTime()) >= rt.cacheExpire {
 					log.Printf("------ --- %s [proxy]\n", r.URL)
 					rt.proxy.ServeHTTP(mw, r)
-					totalRequest.With(prometheus.Labels{"mode": "proxy", "status": mw.status()}).Inc()
+					rt.count("proxy", mw)
 					return
 				}
 				ctype = "text/plain; charset=UTF-8"
@@ -219,20 +241,19 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					ctype = "application/octet-stream"
 				default:
 					http.Error(mw, "request not recognized", http.StatusNotFound)
-					totalRequest.With(prometheus.Labels{"mode": "cached", "status": mw.status()}).Inc()
+					rt.count("cached", mw)
 					return
 				}
 			}
 			mw.Header().Set("Content-Type", ctype)
-			log.Printf("------ --- %s [cached]\n", r.URL)
 			http.ServeContent(mw, r, "", info.ModTime(), f)
-			totalRequest.With(prometheus.Labels{"mode": "cached", "status": mw.status()}).Inc()
+			rt.count("cached", mw)
 			return
 		}
 	}
 	log.Printf("------ --- %s [proxy]\n", r.URL)
 	rt.proxy.ServeHTTP(mw, r)
-	totalRequest.With(prometheus.Labels{"mode": "proxy", "status": mw.status()}).Inc()
+	rt.count("proxy", mw)
 }
 
 // GlobsMatchPath reports whether any path prefix of target

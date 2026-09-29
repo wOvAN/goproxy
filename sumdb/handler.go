@@ -48,11 +48,12 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := make(chan *http.Response)
+	hosts := supportedSumDB[whichDB]
+	result := make(chan *http.Response, len(hosts))
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second) // 2sec maybe enough
 	defer cancel()
 
-	for _, host := range supportedSumDB[whichDB] {
+	for _, host := range hosts {
 		go proxySumdb(ctx, host, realPath, result)
 	}
 
