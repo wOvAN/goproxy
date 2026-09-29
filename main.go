@@ -27,7 +27,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -221,7 +220,7 @@ func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
 	if len(data) == 1 {
 		data = nil
 	}
-	err = os.MkdirAll(path.Dir(file), os.ModePerm)
+	err = os.MkdirAll(filepath.Dir(file), os.ModePerm)
 	if err != nil {
 		log.Printf("make cache dir failed, err: %v.", err)
 		return nil, err
