@@ -45,8 +45,8 @@ func WriteToFile(filename string, data io.Reader, perm os.FileMode) (err error) 
 		// some other process may have created a new file with the same name after
 		// that.
 		if err != nil {
-			f.Close()
-			os.Remove(f.Name())
+			_ = f.Close()
+			_ = os.Remove(f.Name())
 		}
 	}()
 
@@ -72,16 +72,16 @@ func WriteToFile(filename string, data io.Reader, perm os.FileMode) (err error) 
 // Errors are classified heuristically and retries are bounded, so even this
 // function may occasionally return a spurious error on Windows.
 // If so, the error will likely wrap one of:
-// 	- syscall.ERROR_ACCESS_DENIED
-// 	- syscall.ERROR_FILE_NOT_FOUND
-// 	- internal/syscall/windows.ERROR_SHARING_VIOLATION
+//   - syscall.ERROR_ACCESS_DENIED
+//   - syscall.ERROR_FILE_NOT_FOUND
+//   - internal/syscall/windows.ERROR_SHARING_VIOLATION
 func ReadFile(filename string) ([]byte, error) {
 	return robustio.ReadFile(filename)
 }
 
 // tempFile creates a new temporary file with given permission bits.
 func tempFile(dir, prefix string, perm os.FileMode) (f *os.File, err error) {
-	for i := 0; i < 10000; i++ {
+	for range 10000 {
 		name := filepath.Join(dir, prefix+strconv.Itoa(rand.Intn(1000000000))+patternSuffix)
 		f, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
 		if os.IsExist(err) {

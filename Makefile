@@ -1,4 +1,4 @@
-.PHONY: build image clean test
+.PHONY: build image clean test lint
 
 export GO111MODULE=on
 
@@ -15,6 +15,15 @@ image:
 
 test: tidy
 	@go test -v ./...
+
+lint:
+	@golangci-lint run ./...
+
+fmt:
+	@go fmt ./...
+
+fix:
+	@go fix -v ./...
 
 clean:
 	@git clean -f -d -X

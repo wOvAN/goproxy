@@ -197,7 +197,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, openErr.Error(), code)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -251,7 +251,7 @@ func (s *memStat) ModTime() time.Time { return s.t }
 func (s *memStat) IsDir() bool { return false }
 
 // Sys return nil.
-func (s *memStat) Sys() interface{} { return nil }
+func (s *memStat) Sys() any { return nil }
 
 // NewInfo returns a formatted info file for the given version, time pair.
 // The version should be a canonical semantic version.

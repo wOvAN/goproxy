@@ -2,14 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !plan9
+//go:build !plan9
 
 package renameio
 
 import (
 	"encoding/binary"
 	"errors"
-	"io/ioutil"
+
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -24,16 +24,16 @@ import (
 )
 
 func TestConcurrentReadsAndWrites(t *testing.T) {
-	dir, err := ioutil.TempDir("", "renameio")
+	dir, err := os.MkdirTemp("", "renameio")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	path := filepath.Join(dir, "blob.bin")
 
 	const chunkWords = 8 << 10
 	buf := make([]byte, 2*chunkWords*8)
-	for i := uint64(0); i < 2*chunkWords; i++ {
+	for i := range uint64(2 * chunkWords) {
 		binary.LittleEndian.PutUint64(buf[i*8:], i)
 	}
 
@@ -117,7 +117,7 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 		sem <- true
 	}
 
-	var minWriteSuccesses int64 = attempts
+	minWriteSuccesses := attempts
 	if runtime.GOOS == "windows" {
 		// Windows produces frequent "Access is denied" errors under heavy rename load.
 		// As long as those are the only errors and *some* of the writes succeed, we're happy.
@@ -130,7 +130,7 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 		t.Logf("%d (of %d) writes succeeded (ok: ≥ %d)", writeSuccesses, attempts, minWriteSuccesses)
 	}
 
-	var minReadSuccesses int64 = attempts
+	minReadSuccesses := attempts
 	if runtime.GOOS == "windows" {
 		// Windows produces frequent "Access is denied" errors under heavy rename load.
 		// As long as those are the only errors and *some* of the writes succeed, we're happy.

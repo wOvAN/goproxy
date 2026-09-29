@@ -5,7 +5,7 @@ import (
 	"compress/gzip"
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -54,8 +54,8 @@ func (router *Router) customModResponse(r *http.Response) error {
 			if err != nil {
 				return err
 			}
-			defer gr.Close()
-			buf, err = ioutil.ReadAll(gr)
+			defer func() { _ = gr.Close() }()
+			buf, err = io.ReadAll(gr)
 			if err != nil {
 				return err
 			}
@@ -63,15 +63,17 @@ func (router *Router) customModResponse(r *http.Response) error {
 			// rewrite content-length header due to the decompressed data will be refilled in the body
 			r.Header.Set("Content-Length", fmt.Sprint(len(buf)))
 		} else {
-			buf, err = ioutil.ReadAll(r.Body)
+			buf, err = io.ReadAll(r.Body)
 			if err != nil {
 				return err
 			}
 		}
-		r.Body = ioutil.NopCloser(bytes.NewReader(buf))
+		r.Body = io.NopCloser(bytes.NewReader(buf))
 		if buf != nil {
 			file := filepath.Join(router.opts.DownloadRoot, r.Request.URL.Path)
-			os.MkdirAll(path.Dir(file), os.ModePerm)
+			if err = os.MkdirAll(filepath.ToSlash(filepath.Dir(file)), os.ModePerm); err != nil {
+				return err
+			}
 			err = renameio.WriteFile(file, buf, 0666)
 			if err != nil {
 				return err
@@ -94,7 +96,7 @@ func (router *Router) customModResponse(r *http.Response) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		var buf []byte
 		if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
@@ -102,22 +104,24 @@ func (router *Router) customModResponse(r *http.Response) error {
 			if err != nil {
 				return err
 			}
-			defer gr.Close()
-			buf, err = ioutil.ReadAll(gr)
+			defer func() { _ = gr.Close() }()
+			buf, err = io.ReadAll(gr)
 			if err != nil {
 				return err
 			}
 			resp.Header.Del("Content-Encoding")
 		} else {
-			buf, err = ioutil.ReadAll(resp.Body)
+			buf, err = io.ReadAll(resp.Body)
 			if err != nil {
 				return err
 			}
 		}
-		resp.Body = ioutil.NopCloser(bytes.NewReader(buf))
+		resp.Body = io.NopCloser(bytes.NewReader(buf))
 		if buf != nil {
 			file := filepath.Join(router.opts.DownloadRoot, r.Request.URL.Path)
-			os.MkdirAll(path.Dir(file), os.ModePerm)
+			if err = os.MkdirAll(filepath.ToSlash(filepath.Dir(file)), os.ModePerm); err != nil {
+				return err
+			}
 			err = renameio.WriteFile(file, buf, 0666)
 			if err != nil {
 				return err
@@ -144,8 +148,8 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 			return rt
 		}
 		proxy := httputil.NewSingleHostReverseProxy(remote)
-		director := proxy.Director
-		proxy.Director = func(r *http.Request) {
+		director := proxy.Director               //nolint:staticcheck // Director is deprecated; Rewrite would drop the single-host joinURL rewrite
+		proxy.Director = func(r *http.Request) { //nolint:staticcheck
 			director(r)
 			r.Host = remote.Host
 		}
@@ -193,7 +197,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if info, err := os.Stat(file); err == nil {
 		if f, err := os.Open(file); err == nil {
 			var ctype string
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			if strings.HasSuffix(r.URL.Path, "/@latest") {
 				if time.Since(info.ModTime()) >= ListExpire {
 					log.Printf("------ --- %s [proxy]\n", r.URL)
@@ -250,7 +254,6 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("------ --- %s [proxy]\n", r.URL)
 	rt.proxy.ServeHTTP(mw, r)
 	totalRequest.With(prometheus.Labels{"mode": "proxy", "status": mw.status()}).Inc()
-	return
 }
 
 // GlobsMatchPath reports whether any path prefix of target

@@ -61,6 +61,16 @@ NOTE: Patterns are matched to the full path specified, not only to the host comp
 ./bin/goproxy -listen=0.0.0.0:80 -cacheDir=/tmp/test -proxy https://goproxy.io -exclude "*.corp.example.com,rsc.io/private"
 ```
 
+### SumDB Proxy
+
+By default, sumdb (Checksum Database) requests use the same proxy host specified by the `-proxy` flag. You can specify a different sumdb proxy using the `-sumdbProxy` flag:
+
+```shell
+./bin/goproxy -listen=0.0.0.0:80 -proxy https://goproxy.io -sumdbProxy https://goproxy.cn
+```
+
+When the `-sumdbProxy` flag is set, all sumdb requests (including `sum.golang.org`, `sum.golang.google.cn`, and `gosum.io`) will be proxied through the specified host.
+
 ### Private module authentication
 
 Some private modules are gated behind `git` authentication. To resolve this, you can force git to rewrite the URL with a personal access token present for auth
@@ -70,6 +80,20 @@ git config --global url."https://${GITHUB_PERSONAL_ACCESS_TOKEN}@github.com/".in
 ```
 
 This can be done for other git providers as well, following the same pattern
+
+## Build docker image
+
+If you want to build the docker image locally (you don't have to):
+
+```shell
+docker build -t goproxy/goproxy:latest .
+```
+
+or if you are running on arm64
+
+```shell
+docker build --build-arg ARCH=arm64 -t goproxy/goproxy:latest .
+```
 
 ## Use docker image
 

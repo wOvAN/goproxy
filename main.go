@@ -21,7 +21,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+
 	"log"
 	"net/http"
 	"os"
@@ -34,42 +34,45 @@ import (
 	"time"
 
 	"github.com/goproxyio/goproxy/v2/proxy"
+	"github.com/goproxyio/goproxy/v2/sumdb"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/mod/module"
 )
 
 var downloadRoot string
-var listen, promListen string
+var listen string
 var cacheDir string
 var proxyHost string
+var sumdbProxy string
 var excludeHost string
 var cacheExpire time.Duration
 
 func init() {
 	flag.StringVar(&excludeHost, "exclude", "", "exclude host pattern, you can exclude internal Git services")
 	flag.StringVar(&proxyHost, "proxy", "", "next hop proxy for Go Modules, recommend use https://goproxy.io")
+	flag.StringVar(&sumdbProxy, "sumdbProxy", "", "sumdb proxy host, default use proxy value")
 	flag.StringVar(&cacheDir, "cacheDir", "", "Go Modules cache dir, default is $GOPATH/pkg/mod/cache/download")
 	flag.StringVar(&listen, "listen", "0.0.0.0:8081", "service listen address")
 	flag.DurationVar(&cacheExpire, "cacheExpire", 5*time.Minute, "Go Modules cache expiration (min), default is 5 min")
 	flag.Parse()
 
 	if os.Getenv("GIT_TERMINAL_PROMPT") == "" {
-		os.Setenv("GIT_TERMINAL_PROMPT", "0")
+		_ = os.Setenv("GIT_TERMINAL_PROMPT", "0")
 	}
 
 	if os.Getenv("GIT_SSH") == "" && os.Getenv("GIT_SSH_COMMAND") == "" {
-		os.Setenv("GIT_SSH_COMMAND", "ssh -o ControlMaster=no")
+		_ = os.Setenv("GIT_SSH_COMMAND", "ssh -o ControlMaster=no")
 	}
 
 	if excludeHost != "" {
-		os.Setenv("GOPRIVATE", excludeHost)
+		_ = os.Setenv("GOPRIVATE", excludeHost)
 	}
 
 	// Enable Go module
-	os.Setenv("GO111MODULE", "on")
-	os.Setenv("GOPROXY", "direct")
-	os.Setenv("GOSUMDB", "off")
+	_ = os.Setenv("GO111MODULE", "on")
+	_ = os.Setenv("GOPROXY", "direct")
+	_ = os.Setenv("GOSUMDB", "off")
 
 	downloadRoot = getDownloadRoot()
 }
@@ -79,6 +82,12 @@ func main() {
 	log.SetFlags(0)
 
 	var handle http.Handler
+
+	if sumdbProxy != "" {
+		log.Printf("SumDBProxy %s\n", sumdbProxy)
+		sumdb.SetSumdbProxy(sumdbProxy)
+	}
+
 	if proxyHost != "" {
 		log.Printf("ProxyHost %s\n", proxyHost)
 		if excludeHost != "" {
@@ -121,7 +130,7 @@ func getDownloadRoot() string {
 		GOPATH string
 	}
 	if cacheDir != "" {
-		os.Setenv("GOMODCACHE", filepath.Join(cacheDir, "pkg", "mod"))
+		_ = os.Setenv("GOMODCACHE", filepath.Join(cacheDir, "pkg", "mod"))
 		return filepath.Join(cacheDir, "pkg", "mod", "cache", "download")
 	}
 	if err := goJSON(&env, "go", "env", "-json", "GOPATH"); err != nil {
@@ -131,12 +140,12 @@ func getDownloadRoot() string {
 	if len(list) == 0 || list[0] == "" {
 		log.Fatalf("missing $GOPATH")
 	}
-	os.Setenv("GOMODCACHE", filepath.Join(list[0], "pkg", "mod"))
+	_ = os.Setenv("GOMODCACHE", filepath.Join(list[0], "pkg", "mod"))
 	return filepath.Join(list[0], "pkg", "mod", "cache", "download")
 }
 
 // goJSON runs the go command and parses its JSON output into dst.
-func goJSON(dst interface{}, command ...string) error {
+func goJSON(dst any, command ...string) error {
 	cmd := exec.Command(command[0], command[1:]...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -217,7 +226,7 @@ func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
 		log.Printf("make cache dir failed, err: %v.", err)
 		return nil, err
 	}
-	if err := ioutil.WriteFile(file, data, 0666); err != nil {
+	if err := os.WriteFile(file, data, 0666); err != nil {
 		return nil, err
 	}
 

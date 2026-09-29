@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,7 +36,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		// if not check the target db,
 		// curl https://goproxy.io/sumdb/www.google.com will succ
 		w.WriteHeader(http.StatusGone)
-		fmt.Fprint(w, "unsupported db")
+		_, _ = fmt.Fprint(w, "unsupported db")
 		return
 	}
 
@@ -58,15 +59,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	select {
 	case resp := <-result:
 		{
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			w.WriteHeader(resp.StatusCode)
 			if _, err := io.Copy(w, resp.Body); err != nil {
-				fmt.Fprint(w, err.Error())
+				_, _ = fmt.Fprint(w, err.Error())
 			}
 		}
 	case <-ctx.Done():
 		w.WriteHeader(http.StatusGone)
-		fmt.Fprint(w, ctx.Err().Error())
+		_, _ = fmt.Fprint(w, ctx.Err().Error())
 		return
 	}
 }
@@ -86,7 +87,8 @@ func proxySumdb(ctx context.Context, host, path string, respChan chan<- *http.Re
 	if err != nil {
 		return
 	}
-	urlPath.Path = path
+	urlPath.Path = strings.TrimSuffix(urlPath.Path, "/") + "/" + path
+	log.Printf("[sumdb] proxy request to: %s\n", urlPath.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlPath.String(), nil)
 	if err != nil {
@@ -94,13 +96,26 @@ func proxySumdb(ctx context.Context, host, path string, respChan chan<- *http.Re
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		log.Printf("[sumdb] proxy request error: %v\n", err)
 		return
 	}
 
 	select {
 	case <-ctx.Done():
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	case respChan <- resp:
 	}
 
+}
+
+// SetSumdbProxy rewrites the supported sumdb hosts to route through proxyHost.
+func SetSumdbProxy(proxyHost string) {
+	if proxyHost == "" {
+		return
+	}
+	proxyHost = strings.TrimSuffix(proxyHost, "/")
+	for dbName := range supportedSumDB {
+		proxyURL := proxyHost + "/sumdb/" + dbName + "/"
+		supportedSumDB[dbName] = []string{proxyURL}
+	}
 }

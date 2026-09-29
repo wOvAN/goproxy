@@ -9,9 +9,12 @@ RUN cd /src/goproxy &&\
 
 FROM golang:alpine
 
+ARG ARCH=amd64
+
 # Add tini
 ENV TINI_VERSION v0.19.0
-ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-static-amd64 /usr/bin/tini
+ENV TINI_ARCH=$ARCH
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-static-${TINI_ARCH} /usr/bin/tini
 RUN chmod +x /usr/bin/tini
 
 RUN apk add --no-cache -U git mercurial subversion
