@@ -9,11 +9,12 @@ RUN cd /src/goproxy &&\
 
 FROM golang:alpine
 
-ARG ARCH=amd64
+ARG ARCH=
+ARG TARGETARCH
 
 # Add tini
 ENV TINI_VERSION v0.19.0
-ENV TINI_ARCH=$ARCH
+ENV TINI_ARCH=${ARCH:-$TARGETARCH}
 ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-static-${TINI_ARCH} /usr/bin/tini
 RUN chmod +x /usr/bin/tini
 

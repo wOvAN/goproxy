@@ -89,16 +89,18 @@ If you want to build the docker image locally (you don't have to):
 docker build -t goproxy/goproxy:latest .
 ```
 
-or if you are running on arm64
-
-```shell
-docker build --build-arg ARCH=arm64 -t goproxy/goproxy:latest .
-```
+The image architecture is detected automatically. To force one, pass `--build-arg ARCH=amd64` (or `arm64`).
 
 ## Use docker image
 
 ```shell
 docker run -d -p80:8081 goproxy/goproxy
+```
+
+Published multi-arch (`linux/amd64`, `linux/arm64`) images for this fork are on GHCR:
+
+```shell
+docker run -d -p80:8081 ghcr.io/wovan/goproxy:latest
 ```
 
 Use the -v flag to persisting the proxy module data (change ___cacheDir___ to your own dir):
