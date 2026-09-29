@@ -51,9 +51,14 @@ var sumdbProxy string
 var excludeHost string
 var cacheExpire time.Duration
 
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 // setup parses flags and prepares the environment for the go command.
 // It runs from main (not init) so test binaries are not polluted with flag parsing.
 func setup() {
+	var showVersion bool
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.StringVar(&excludeHost, "exclude", "", "exclude host pattern, you can exclude internal Git services")
 	flag.StringVar(&proxyHost, "proxy", "", "next hop proxy for Go Modules, recommend use https://goproxy.io")
 	flag.StringVar(&sumdbProxy, "sumdbProxy", "", "sumdb proxy host; empty (default) races the built-in sumdb mirrors directly")
@@ -61,6 +66,11 @@ func setup() {
 	flag.StringVar(&listen, "listen", "0.0.0.0:8081", "service listen address")
 	flag.DurationVar(&cacheExpire, "cacheExpire", 5*time.Minute, "Go Modules cache expiration (min), default is 5 min")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	if os.Getenv("GIT_TERMINAL_PROMPT") == "" {
 		_ = os.Setenv("GIT_TERMINAL_PROMPT", "0")
@@ -86,6 +96,7 @@ func main() {
 	setup()
 	log.SetPrefix("goproxy.io: ")
 	log.SetFlags(0)
+	log.Printf("version %s\n", version)
 
 	var handle http.Handler
 

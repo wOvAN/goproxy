@@ -2,10 +2,12 @@
 
 export GO111MODULE=on
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 all: build
 
 build: tidy
-	@go build -o bin/goproxy -ldflags "-s -w" .
+	@go build -o bin/goproxy -ldflags "-s -w -X main.version=$(VERSION)" .
 
 tidy:
 	@go mod tidy
