@@ -46,39 +46,13 @@ type Router struct {
 }
 
 func (router *Router) customModResponse(r *http.Response) error {
-	var err error
+	// Only module files may be stored in the download cache.
+	if p := r.Request.URL.Path; !strings.Contains(p, "/@v/") && !strings.HasSuffix(p, "/@latest") {
+		return nil
+	}
 	if r.StatusCode == http.StatusOK {
-		var buf []byte
-		if strings.Contains(r.Header.Get("Content-Encoding"), "gzip") {
-			gr, err := gzip.NewReader(r.Body)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = gr.Close() }()
-			buf, err = io.ReadAll(gr)
-			if err != nil {
-				return err
-			}
-			r.Header.Del("Content-Encoding")
-			// rewrite content-length header due to the decompressed data will be refilled in the body
-			r.Header.Set("Content-Length", fmt.Sprint(len(buf)))
-		} else {
-			buf, err = io.ReadAll(r.Body)
-			if err != nil {
-				return err
-			}
-		}
-		r.Body = io.NopCloser(bytes.NewReader(buf))
-		if buf != nil {
-			file := filepath.Join(router.opts.DownloadRoot, r.Request.URL.Path)
-			if err = os.MkdirAll(filepath.ToSlash(filepath.Dir(file)), os.ModePerm); err != nil {
-				return err
-			}
-			err = renameio.WriteFile(file, buf, 0666)
-			if err != nil {
-				return err
-			}
-		}
+		file := filepath.Join(router.opts.DownloadRoot, r.Request.URL.Path)
+		return cacheResponseBody(r, file)
 	}
 	// support 302 status code.
 	if r.StatusCode == http.StatusFound {
@@ -86,47 +60,52 @@ func (router *Router) customModResponse(r *http.Response) error {
 		if loc == "" {
 			return fmt.Errorf("%d response missing Location header", r.StatusCode)
 		}
-
-		// TODO: location is relative.
-		_, err := url.Parse(loc)
+		u, err := url.Parse(loc)
 		if err != nil {
 			return fmt.Errorf("failed to parse Location header %q: %v", loc, err)
 		}
-		resp, err := http.Get(loc)
+		resp, err := http.Get(r.Request.URL.ResolveReference(u).String())
 		if err != nil {
 			return err
 		}
 		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			// Do not cache the body of an error response as a module file.
+			return nil
+		}
+		file := filepath.Join(router.opts.DownloadRoot, r.Request.URL.Path)
+		return cacheResponseBody(resp, file)
+	}
+	return nil
+}
 
-		var buf []byte
-		if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
-			gr, err := gzip.NewReader(resp.Body)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = gr.Close() }()
-			buf, err = io.ReadAll(gr)
-			if err != nil {
-				return err
-			}
-			resp.Header.Del("Content-Encoding")
-		} else {
-			buf, err = io.ReadAll(resp.Body)
-			if err != nil {
-				return err
-			}
+func cacheResponseBody(resp *http.Response, file string) error {
+	var buf []byte
+	if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return err
 		}
-		resp.Body = io.NopCloser(bytes.NewReader(buf))
-		if buf != nil {
-			file := filepath.Join(router.opts.DownloadRoot, r.Request.URL.Path)
-			if err = os.MkdirAll(filepath.ToSlash(filepath.Dir(file)), os.ModePerm); err != nil {
-				return err
-			}
-			err = renameio.WriteFile(file, buf, 0666)
-			if err != nil {
-				return err
-			}
+		defer func() { _ = gr.Close() }()
+		buf, err = io.ReadAll(gr)
+		if err != nil {
+			return err
 		}
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Set("Content-Length", fmt.Sprint(len(buf)))
+	} else {
+		var err error
+		buf, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(buf))
+	if buf != nil {
+		if err := os.MkdirAll(filepath.ToSlash(filepath.Dir(file)), os.ModePerm); err != nil {
+			return err
+		}
+		return renameio.WriteFile(file, buf, 0666)
 	}
 	return nil
 }
@@ -216,7 +195,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			i := strings.Index(r.URL.Path, "/@v/")
 			if i < 0 {
 				http.Error(mw, "no such path", http.StatusNotFound)
-				totalRequest.With(prometheus.Labels{"mode": "proxy", "status": mw.status()}).Inc()
+				totalRequest.With(prometheus.Labels{"mode": "cached", "status": mw.status()}).Inc()
 				return
 			}
 
@@ -240,7 +219,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					ctype = "application/octet-stream"
 				default:
 					http.Error(mw, "request not recognized", http.StatusNotFound)
-					totalRequest.With(prometheus.Labels{"mode": "proxy", "status": mw.status()}).Inc()
+					totalRequest.With(prometheus.Labels{"mode": "cached", "status": mw.status()}).Inc()
 					return
 				}
 			}

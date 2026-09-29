@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
 
 	"log"
 	"net/http"
@@ -48,7 +49,9 @@ var sumdbProxy string
 var excludeHost string
 var cacheExpire time.Duration
 
-func init() {
+// setup parses flags and prepares the environment for the go command.
+// It runs from main (not init) so test binaries are not polluted with flag parsing.
+func setup() {
 	flag.StringVar(&excludeHost, "exclude", "", "exclude host pattern, you can exclude internal Git services")
 	flag.StringVar(&proxyHost, "proxy", "", "next hop proxy for Go Modules, recommend use https://goproxy.io")
 	flag.StringVar(&sumdbProxy, "sumdbProxy", "", "sumdb proxy host, default use proxy value")
@@ -78,11 +81,15 @@ func init() {
 }
 
 func main() {
+	setup()
 	log.SetPrefix("goproxy.io: ")
 	log.SetFlags(0)
 
 	var handle http.Handler
 
+	if sumdbProxy == "" {
+		sumdbProxy = proxyHost
+	}
 	if sumdbProxy != "" {
 		log.Printf("SumDBProxy %s\n", sumdbProxy)
 		sumdb.SetSumdbProxy(sumdbProxy)
@@ -144,6 +151,27 @@ func getDownloadRoot() string {
 	return filepath.Join(list[0], "pkg", "mod", "cache", "download")
 }
 
+// goNotFoundPatterns are substrings of go command diagnostics that mean
+// "the module or version does not exist" as opposed to a transient failure.
+var goNotFoundPatterns = []string{
+	"no matching versions",
+	"unknown revision",
+	"cannot find module",
+	"malformed module path",
+}
+
+// mapNotFound tags go command errors that indicate a missing module with
+// fs.ErrNotExist so that the proxy can answer 404 instead of 500.
+func mapNotFound(err error) error {
+	msg := err.Error()
+	for _, p := range goNotFoundPatterns {
+		if strings.Contains(msg, p) {
+			return fmt.Errorf("%w: %s", fs.ErrNotExist, msg)
+		}
+	}
+	return err
+}
+
 // goJSON runs the go command and parses its JSON output into dst.
 func goJSON(dst any, command ...string) error {
 	cmd := exec.Command(command[0], command[1:]...)
@@ -151,7 +179,7 @@ func goJSON(dst any, command ...string) error {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s:\n%s%s", strings.Join(command, " "), stderr.String(), stdout.String())
+		return mapNotFound(fmt.Errorf("%s:\n%s%s", strings.Join(command, " "), stderr.String(), stdout.String()))
 	}
 	if err := json.Unmarshal(stdout.Bytes(), dst); err != nil {
 		return fmt.Errorf("%s: reading json: %v", strings.Join(command, " "), err)
