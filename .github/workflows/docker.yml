@@ -10,7 +10,8 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ toLower(github.repository) }}
+  # GHCR requires a lowercase namespace; owner login is wOvAN.
+  IMAGE: ghcr.io/wovan/goproxy
 
 jobs:
   image:
