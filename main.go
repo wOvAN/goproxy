@@ -56,7 +56,7 @@ var cacheExpire time.Duration
 func setup() {
 	flag.StringVar(&excludeHost, "exclude", "", "exclude host pattern, you can exclude internal Git services")
 	flag.StringVar(&proxyHost, "proxy", "", "next hop proxy for Go Modules, recommend use https://goproxy.io")
-	flag.StringVar(&sumdbProxy, "sumdbProxy", "", "sumdb proxy host, default use proxy value")
+	flag.StringVar(&sumdbProxy, "sumdbProxy", "", "sumdb proxy host; empty (default) races the built-in sumdb mirrors directly")
 	flag.StringVar(&cacheDir, "cacheDir", "", "Go Modules cache dir, default is $GOPATH/pkg/mod/cache/download")
 	flag.StringVar(&listen, "listen", "0.0.0.0:8081", "service listen address")
 	flag.DurationVar(&cacheExpire, "cacheExpire", 5*time.Minute, "Go Modules cache expiration (min), default is 5 min")
@@ -89,9 +89,6 @@ func main() {
 
 	var handle http.Handler
 
-	if sumdbProxy == "" {
-		sumdbProxy = proxyHost
-	}
 	if sumdbProxy != "" {
 		log.Printf("SumDBProxy %s\n", sumdbProxy)
 		sumdb.SetSumdbProxy(sumdbProxy)
