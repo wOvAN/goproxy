@@ -9,13 +9,14 @@ goproxy (goproxy.io) is a global proxy for Go modules. It does **not** fetch mod
 ## Commands
 
 ```shell
-make            # build: go mod tidy + go build -o bin/goproxy -ldflags "-s -w"
+make            # build: go mod tidy + go build -ldflags "-s -w -X main.version=$(git describe ...)" — embeds version, printed at startup and by `-version`
 make test       # go test -v ./...
+make lint       # golangci-lint run ./...
 make image      # docker build -t goproxy/goproxy .
 make clean      # git clean -f -d -X — DESTRUCTIVE, removes untracked files incl. bin/
 ```
 
-Run a single test: `go test ./renameio/ -run TestName` (unit tests exist only in `renameio/` and `sumdb/`).
+Run a single test: `go test ./sumdb/ -run TestName` (unit tests in `main_test.go`, `renameio/`, `sumdb/`).
 
 End-to-end test (mirrors CI): start the proxy, then run the get script:
 
@@ -34,10 +35,18 @@ Handler chain in `main.go`: `logger` (access log + `/metrics` via promhttp) wrap
 - **`main.go` — `ops`** implements `proxy.ServerOps` by invoking the `go` command and serving files from the download cache root: `$cacheDir/pkg/mod/cache/download` (default `$GOPATH/pkg/mod/cache/download`). Layout: `<escaped-module-path>/@v/{list,.info,.mod,.zip}`. `list` files are cached with a TTL (`-cacheExpire`, default 5 min).
 - **`proxy/server.go`** — the module proxy HTTP protocol: `/p/@v/list`, `/p/@latest`, `/p/@v/vN.info|.mod|.zip`. Unescapes module paths with `golang.org/x/mod/module`. 404 vs 500 is decided by `errors.Is(err, fs.ErrNotExist)` (go command not-found diagnostics are tagged in `mapNotFound`, main.go).
 - **`proxy/router.go`** — router mode: an `httputil.ReverseProxy` to the upstream (`-proxy`, e.g. https://goproxy.io). Module paths matching the `-exclude` comma-separated globs (`GlobsMatchPath`, matched against the full path, not just the host) bypass the upstream and go direct to the local `go` command. `ModifyResponse` (`customModResponse`) streams upstream responses into the local download cache (`renameio.WriteToFile`, no full-response buffering), so later requests are served from cache. `@latest` files expire on `ListExpire` (hardcoded 5 min); `list` files use `cacheExpire`. Note: the reverse proxy transport sets `InsecureSkipVerify: true`.
-- **`sumdb/handler.go`** — no real sum database; `/sumdb/<db>/...` is proxied by racing `sum.golang.org` / `sum.golang.google.cn` / `gosum.io` with a 2s timeout and returning the first response. `/sumdb/<db>/supported` returns 200. Any other db name returns 410.
+- **`sumdb/handler.go`** — no real sum database; `sumdb.Handler` (built via `sumdb.NewHandler(downloadRoot, fetchDisabled)`, injected into `Server`/`Router`) proxies `/sumdb/<db>/...` to the db's upstream hosts **in priority order** (first 200 wins, 2s timeout per host, all-fail → 410). Content-addressed `tile/...` and `lookup/...` responses are cached immutably under `downloadRoot/sumdb/<db>/...` (the go client's own layout) and served from cache later; `latest` is never cached. `-sumdbProxy` (default empty = direct mirrors) rewrites the hosts to route through that proxy instead (`SetSumdbProxy`). `/sumdb/<db>/supported` returns 200. Any other db name returns 410. Upstream paths are built from the cleaned path — `..` segments cannot escape the cache dir.
 - **`renameio/` + `robustio/`** — vendored copies of the Go team's atomic-write helpers (temp file + rename, Windows retry logic, umask preservation). `router.go` uses `renameio.WriteFile` for cache writes. Keep using them for cache-file writes rather than raw `os.WriteFile`.
 
-Environment invariants set in `main.go` `init()`: `GO111MODULE=on`, `GOPROXY=direct`, `GOSUMDB=off`, `GIT_TERMINAL_PROMPT=0`, and `GOPRIVATE` (from `-exclude`). These force the underlying `go` command to always fetch directly, so the proxy never loops back into itself.
+Environment invariants set in `main.go` `setup()` (flags parsed there, not `init()`, so test binaries are not polluted): `GO111MODULE=on`, `GOPROXY=direct`, `GOSUMDB=off`, `GIT_TERMINAL_PROMPT=0`, and `GOPRIVATE` (from `-exclude`). These force the underlying `go` command to always fetch directly, so the proxy never loops back into itself. Hot path: `doOnce` merges concurrent fetches of the same module into one go command run, `goCmdSem` bounds concurrent go subprocesses (2*NumCPU), and `cachedFile`/`List` serve from the download cache before ever spawning a go command.
+
+**Cache-only mode (`Disable-Module-Fetch`)**: the request header `Disable-Module-Fetch: true` (or the global `-disableModuleFetch` flag, wired into `RouterOptions.DisableModuleFetch`, the `ops` ctx via `proxy.WithFetchDisabled`, and `sumdb.NewHandler`) makes every handler serve from the download cache only — list/@latest served past TTL, version files/sumdb tiles from cache, cache miss → `410` with a `Disable-Module-Fetch: true` response header, no go command and no upstream ever run. `proxy.ErrFetchDisabled` is the sentinel ops return for that mapping.
+
+**Cache-Control (`proxy/cachecontrol.go: cacheControlFor`)**: list and `@latest` get `public, max-age=300`; `.info/.mod/.zip` and sumdb `tile/`+`lookup/` (immutable) get `max-age=604800`; sumdb `latest` 60; sumdb `supported` `no-store`. Applied in `Server.ServeHTTP`, `Router.serveFromCache`, `customModResponse` (upstream pass-through) and the sumdb handler.
+
+**Metrics**: `proxy.MetricsMiddleware(mode, h)` counts proxy-mode (Server) requests under mode `direct`; router mode counts its own (`direct`/`proxy`/`cached`/`sumdb`) — do not wrap the router in the middleware, it would double-count.
+
+**Cache GC (`gc.go`)**: `-gcInterval` (default 0 = off) runs a periodic `sweepCache(downloadRoot, gcKeep)` goroutine: deletes files in the download cache with atime older than `-gcKeep` (default 14d), then prunes emptied dirs deepest-first; root itself and non-empty dirs are never removed. Portable atime access is per-platform (`gc_unix.go`/`gc_darwin.go`/`gc_windows.go` build-tagged on `atime(fs.FileInfo)`); platforms without atime are a no-op. GC scans only `downloadRoot` (not `pkg/mod/cache/vcs`), so git caches are untouched.
 
 **Deadlock constraint** (documented in `main.go`): the proxy must not share a GOPATH with its own clients — the client locks a module as "being downloaded" before sending the request to the proxy, which then waits on that same download. Use a separate `-cacheDir` (as `test/get_test.sh` does with `GOPATH=/tmp/go`).
 

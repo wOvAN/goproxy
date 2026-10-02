@@ -2,22 +2,35 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package sumdb implements sumdb handler proxy.
 package sumdb
 
 import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// useTestUpstreams points db at the given upstream base URLs for the
+// duration of the test and restores the original map afterwards.
+func useTestUpstreams(t *testing.T, db string, urls ...string) {
+	t.Helper()
+	orig := supportedSumDB[db]
+	supportedSumDB[db] = urls
+	t.Cleanup(func() { supportedSumDB[db] = orig })
+}
 
 func TestHandler(t *testing.T) {
 	if ret := t.Run("supported", testSupported); !ret {
 		t.Error("supported test failed, stop test")
 		t.FailNow()
 	}
-	t.Run("proxy", testProxy)
+	t.Run("fallback", testFallback)
+	t.Run("cache", testCache)
+	t.Run("fetchDisabled", testFetchDisabled)
 }
 
 func testSupported(t *testing.T) {
@@ -50,11 +63,12 @@ func testSupported(t *testing.T) {
 		},
 	}
 
+	h := NewHandler(t.TempDir(), false)
 	for _, testcase := range tests {
 		t.Run(testcase.name, func(t *testing.T) {
 			recoder := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("https://goproxy.io/sumdb/%s/supported", testcase.db), nil)
-			Handler(recoder, req)
+			h.ServeHTTP(recoder, req)
 
 			resp := recoder.Result()
 			if support := (resp.StatusCode == http.StatusOK); support != testcase.wantSupported {
@@ -65,35 +79,192 @@ func testSupported(t *testing.T) {
 	}
 }
 
-func testProxy(t *testing.T) {
-	type TestCase struct {
-		name       string
-		db         string
-		path       string
-		expectSucc bool
+func testFallback(t *testing.T) {
+	var hits1, hits2 int
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits1++
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer s1.Close()
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits2++
+		fmt.Fprint(w, "ok")
+	}))
+	defer s2.Close()
+
+	useTestUpstreams(t, "sum.golang.org", s1.URL, s2.URL)
+	h := NewHandler(t.TempDir(), false)
+
+	// Primary fails → fall back to secondary.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/lookup/github.com/x/y@v1.0.0", nil)
+	h.ServeHTTP(rec, req)
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("fallback status = %d, want 200", resp.StatusCode)
 	}
-	tests := []TestCase{
-		{
-			name:       "lookup",
-			db:         "sum.golang.google.cn",
-			path:       "lookup/github.com/goproxyio/goproxy@v1.0.0", // this is a fake testcase
-			expectSucc: true,
-		},
+	_ = resp.Body.Close()
+	if hits1 != 1 || hits2 != 1 {
+		t.Errorf("fallback hits = (%d, %d), want (1, 1)", hits1, hits2)
 	}
 
-	for _, testcase := range tests {
-		t.Run(testcase.name, func(t *testing.T) {
+	// Healthy primary short-circuits the secondary.
+	base2 := hits2
+	s2b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("secondary must not be contacted when primary answers 200")
+	}))
+	defer s2b.Close()
+	useTestUpstreams(t, "sum.golang.org", s2.URL, s2b.URL)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/latest", nil)
+	h.ServeHTTP(rec, req)
+	resp = rec.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("primary status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+	// s2 (index 0) answered once more; s2b (index 1) must not have been
+	// hit at all (it would t.Error).
+	if hits2 != base2+1 {
+		t.Errorf("short-circuit: healthy primary hits = %d, want %d", hits2, base2+1)
+	}
 
-			recoder := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("https://goproxy.io/sumdb/%s/%s", testcase.db, testcase.path), nil)
-			Handler(recoder, req)
+	// All upstreams unreachable → 410.
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	useTestUpstreams(t, "sum.golang.org", deadURL)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/latest", nil)
+	h.ServeHTTP(rec, req)
+	resp = rec.Result()
+	if resp.StatusCode != http.StatusGone {
+		t.Errorf("all-fail status = %d, want 410", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+}
 
-			resp := recoder.Result()
-			if succ := (resp.StatusCode == http.StatusOK); succ != testcase.expectSucc {
-				t.Errorf("FETCH from db %s/%s got unexpect http status %d", testcase.db, testcase.path, resp.StatusCode)
-				return
-			}
-		})
+func testCache(t *testing.T) {
+	var hits int
+	var lastPath string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		lastPath = r.URL.Path
+		fmt.Fprint(w, "tile-data")
+	}))
+	defer up.Close()
+
+	root := t.TempDir()
+	useTestUpstreams(t, "sum.golang.org", up.URL)
+	h := NewHandler(root, false)
+
+	get := func(path string) *http.Response {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "https://goproxy.io"+path, nil)
+		h.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	// First lookup fetches upstream and writes the cache file.
+	resp := get("/sumdb/sum.golang.org/lookup/github.com/x/y@v1.0.0")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first lookup status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+	if hits != 1 {
+		t.Fatalf("upstream hits after first lookup = %d, want 1", hits)
+	}
+	cacheFile := filepath.Join(root, "sumdb", "sum.golang.org", "lookup", "github.com/x/y@v1.0.0")
+	data, err := os.ReadFile(filepath.FromSlash(cacheFile))
+	if err != nil {
+		t.Fatalf("cache file not written: %v", err)
+	}
+	if string(data) != "tile-data" {
+		t.Errorf("cache content = %q, want %q", data, "tile-data")
+	}
+	if cc := resp.Header.Get("Cache-Control"); !strings.HasPrefix(cc, "public, max-age=") {
+		t.Errorf("immutable lookup Cache-Control = %q, want public max-age", cc)
+	}
+
+	// Second lookup is served from cache without touching upstream.
+	resp = get("/sumdb/sum.golang.org/lookup/github.com/x/y@v1.0.0")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cached lookup status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+	if hits != 1 {
+		t.Errorf("upstream hits after cached lookup = %d, want still 1", hits)
+	}
+
+	// @latest is volatile: never cached, proxied every time.
+	resp = get("/sumdb/sum.golang.org/latest")
+	_ = resp.Body.Close()
+	if hits != 2 {
+		t.Errorf("upstream hits after latest = %d, want 2 (latest must not be cached)", hits)
+	}
+
+	// Traversal segments are cleaned into the cache root, not escaped.
+	resp = get("/sumdb/sum.golang.org/lookup/../../../../etc/passwd")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("traversal status = %d, want 200", resp.StatusCode)
+	}
+	if strings.Contains(lastPath, "..") {
+		t.Errorf("upstream path escaped: %q", lastPath)
+	}
+	if _, err := os.Stat(filepath.Join(root, "etc")); err == nil {
+		t.Error("traversal wrote outside the sumdb cache dir")
+	}
+}
+
+func testFetchDisabled(t *testing.T) {
+	var hits int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		fmt.Fprint(w, "d")
+	}))
+	defer up.Close()
+
+	root := t.TempDir()
+	useTestUpstreams(t, "sum.golang.org", up.URL)
+	h := NewHandler(root, false)
+
+	// Prime the cache with one lookup.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/lookup/github.com/x/y@v1.0.0", nil)
+	h.ServeHTTP(rec, req)
+	_ = rec.Result().Body.Close()
+	hits = 0
+
+	// A handler in cache-only mode serves the cached entry and 410s misses,
+	// never touching upstream.
+	hd := NewHandler(root, true)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/lookup/github.com/x/y@v1.0.0", nil)
+	hd.ServeHTTP(rec, req)
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("cache-only hit status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Disable-Module-Fetch"); got != "true" {
+		t.Errorf("cache-only hit Disable-Module-Fetch = %q, want true", got)
+	}
+	_ = resp.Body.Close()
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/latest", nil)
+	hd.ServeHTTP(rec, req)
+	resp = rec.Result()
+	if resp.StatusCode != http.StatusGone {
+		t.Errorf("cache-only miss status = %d, want 410", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Disable-Module-Fetch"); got != "true" {
+		t.Errorf("cache-only miss Disable-Module-Fetch = %q, want true", got)
+	}
+	_ = resp.Body.Close()
+
+	if hits != 0 {
+		t.Errorf("cache-only mode touched upstream %d times, want 0", hits)
 	}
 }
 
@@ -190,9 +361,9 @@ func TestSetSumdbProxy(t *testing.T) {
 	}()
 
 	type TestCase struct {
-		name       string
-		proxyHost  string
-		wantURLs   map[string]string
+		name      string
+		proxyHost string
+		wantURLs  map[string]string
 	}
 
 	tests := []TestCase{
@@ -201,7 +372,7 @@ func TestSetSumdbProxy(t *testing.T) {
 			proxyHost: "",
 			wantURLs: map[string]string{
 				"sum.golang.org":       "https://sum.golang.org/",
-				"sum.golang.google.cn": "https://sum.golang.org/",
+				"sum.golang.google.cn": "https://sum.golang.google.cn/",
 				"gosum.io":             "https://gosum.io/",
 			},
 		},
@@ -281,11 +452,12 @@ func TestHandlerInvalidPath(t *testing.T) {
 		},
 	}
 
+	h := NewHandler(t.TempDir(), false)
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("https://goproxy.io%s", tc.path), nil)
-			Handler(recorder, req)
+			h.ServeHTTP(recorder, req)
 
 			resp := recorder.Result()
 			if resp.StatusCode != tc.expectedStatus {

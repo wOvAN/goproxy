@@ -50,6 +50,9 @@ var proxyHost string
 var sumdbProxy string
 var excludeHost string
 var cacheExpire time.Duration
+var disableModuleFetch bool
+var gcInterval time.Duration
+var gcKeep time.Duration
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
@@ -65,6 +68,9 @@ func setup() {
 	flag.StringVar(&cacheDir, "cacheDir", "", "Go Modules cache dir, default is $GOPATH/pkg/mod/cache/download")
 	flag.StringVar(&listen, "listen", "0.0.0.0:8081", "service listen address")
 	flag.DurationVar(&cacheExpire, "cacheExpire", 5*time.Minute, "Go Modules cache expiration (min), default is 5 min")
+	flag.BoolVar(&disableModuleFetch, "disableModuleFetch", false, "serve modules and sumdb from the cache only; never fetch upstream")
+	flag.DurationVar(&gcInterval, "gcInterval", 0, "cache garbage collection interval; a cache file untouched for gcKeep is deleted; 0 disables GC")
+	flag.DurationVar(&gcKeep, "gcKeep", 14*24*time.Hour, "cache file age (since last access) to keep during GC")
 	flag.Parse()
 
 	if showVersion {
@@ -104,20 +110,26 @@ func main() {
 		log.Printf("SumDBProxy %s\n", sumdbProxy)
 		sumdb.SetSumdbProxy(sumdbProxy)
 	}
+	if disableModuleFetch {
+		log.Println("module fetch disabled: serving from cache only")
+	}
+	sumdbHandler := sumdb.NewHandler(downloadRoot, disableModuleFetch)
 
 	if proxyHost != "" {
 		log.Printf("ProxyHost %s\n", proxyHost)
 		if excludeHost != "" {
 			log.Printf("ExcludeHost %s\n", excludeHost)
 		}
-		handle = &logger{proxy.NewRouter(proxy.NewServer(new(ops)), &proxy.RouterOptions{
-			Pattern:      excludeHost,
-			Proxy:        proxyHost,
-			DownloadRoot: downloadRoot,
-			CacheExpire:  cacheExpire,
+		handle = &logger{proxy.NewRouter(proxy.NewServer(new(ops), sumdbHandler), &proxy.RouterOptions{
+			Pattern:            excludeHost,
+			Proxy:              proxyHost,
+			DownloadRoot:       downloadRoot,
+			CacheExpire:        cacheExpire,
+			Sumdb:              sumdbHandler,
+			DisableModuleFetch: disableModuleFetch,
 		})}
 	} else {
-		handle = &logger{proxy.NewServer(new(ops))}
+		handle = &logger{proxy.MetricsMiddleware("direct", proxy.NewServer(new(ops), sumdbHandler))}
 	}
 
 	server := &http.Server{
@@ -133,6 +145,9 @@ func main() {
 			}
 		}
 	}()
+	if gcInterval > 0 {
+		go runCacheGC()
+	}
 
 	s := make(chan os.Signal, 1)
 	signal.Notify(s, os.Interrupt, syscall.SIGTERM)
@@ -239,12 +254,20 @@ type ops struct{}
 
 // NewContext creates a context.
 func (*ops) NewContext(r *http.Request) (context.Context, error) {
-	return context.Background(), nil
+	ctx := context.Background()
+	if disableModuleFetch || r.Header.Get(proxy.HeaderDisableModuleFetch) == "true" {
+		ctx = proxy.WithFetchDisabled(ctx, true)
+	}
+	return ctx, nil
 }
 
-// List lists proxy files.
+// List lists proxy files. In cache-only mode it serves the cached list
+// file regardless of its age and never runs the go command.
 func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
 	file := listPath(mpath)
+	if proxy.FetchDisabled(ctx) {
+		return openCached(file)
+	}
 	if info, err := os.Stat(file); err == nil && time.Since(info.ModTime()) < cacheExpire {
 		return os.Open(file)
 	}
@@ -253,6 +276,16 @@ func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
 		return nil, err
 	}
 	return proxy.MemFile(data, time.Now()), nil
+}
+
+// openCached opens a download-cache file, mapping any failure to
+// ErrFetchDisabled so the server answers 410 in cache-only mode.
+func openCached(file string) (proxy.File, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", proxy.ErrFetchDisabled, file)
+	}
+	return f, nil
 }
 
 // fetchList resolves the version list for mpath, merging concurrent requests
@@ -289,8 +322,12 @@ func fetchList(mpath string) ([]byte, error) {
 	return v.([]byte), nil
 }
 
-// Latest fetches latest file.
+// Latest fetches latest file. In cache-only mode it resolves the latest
+// known version from the cached list file and serves its cached info file.
 func (*ops) Latest(ctx context.Context, path string) (proxy.File, error) {
+	if proxy.FetchDisabled(ctx) {
+		return latestFromCache(path)
+	}
 	d, err := download(module.Version{Path: path, Version: "latest"})
 	if err != nil {
 		return nil, err
@@ -298,10 +335,38 @@ func (*ops) Latest(ctx context.Context, path string) (proxy.File, error) {
 	return os.Open(d.Info)
 }
 
+// latestFromCache answers @latest from the cached version list, without
+// running the go command.
+func latestFromCache(mpath string) (proxy.File, error) {
+	data, err := os.ReadFile(listPath(mpath))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", proxy.ErrFetchDisabled, listPath(mpath))
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	var latest string
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i] != "" {
+			latest = lines[i]
+			break
+		}
+	}
+	if latest == "" {
+		return nil, fmt.Errorf("%w: empty list for %s", proxy.ErrFetchDisabled, mpath)
+	}
+	f, err := cachedFile(module.Version{Path: mpath, Version: latest}, ".info")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s@%s", proxy.ErrFetchDisabled, mpath, latest)
+	}
+	return f, nil
+}
+
 // Info fetches info file.
 func (*ops) Info(ctx context.Context, m module.Version) (proxy.File, error) {
 	if f, err := cachedFile(m, ".info"); err == nil {
 		return f, nil
+	}
+	if proxy.FetchDisabled(ctx) {
+		return nil, fmt.Errorf("%w: %s", proxy.ErrFetchDisabled, m)
 	}
 	d, err := download(m)
 	if err != nil {
@@ -315,6 +380,9 @@ func (*ops) GoMod(ctx context.Context, m module.Version) (proxy.File, error) {
 	if f, err := cachedFile(m, ".mod"); err == nil {
 		return f, nil
 	}
+	if proxy.FetchDisabled(ctx) {
+		return nil, fmt.Errorf("%w: %s", proxy.ErrFetchDisabled, m)
+	}
 	d, err := download(m)
 	if err != nil {
 		return nil, err
@@ -326,6 +394,9 @@ func (*ops) GoMod(ctx context.Context, m module.Version) (proxy.File, error) {
 func (*ops) Zip(ctx context.Context, m module.Version) (proxy.File, error) {
 	if f, err := cachedFile(m, ".zip"); err == nil {
 		return f, nil
+	}
+	if proxy.FetchDisabled(ctx) {
+		return nil, fmt.Errorf("%w: %s", proxy.ErrFetchDisabled, m)
 	}
 	d, err := download(m)
 	if err != nil {

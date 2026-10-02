@@ -44,6 +44,16 @@ func (mw *metricsResponseWriter) status() string {
 	return strconv.Itoa(mw.statusCode)
 }
 
+// MetricsMiddleware counts every request handled by next under the given
+// mode label, for handler chains that do not count internally (proxy mode).
+func MetricsMiddleware(mode string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mw := NewMetricsResponseWriter(w)
+		next.ServeHTTP(mw, r)
+		totalRequest.WithLabelValues(mode, mw.status()).Inc()
+	})
+}
+
 // ReadFrom forwards to the underlying writer to keep the sendfile fast path.
 func (mw *metricsResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 	if rf, ok := mw.ResponseWriter.(io.ReaderFrom); ok {

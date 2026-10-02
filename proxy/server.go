@@ -18,10 +18,34 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goproxyio/goproxy/v2/sumdb"
-
 	"golang.org/x/mod/module"
 )
+
+// HeaderDisableModuleFetch is the request and response header used to
+// request (and acknowledge) cache-only serving: when set to "true", the
+// proxy answers from its cache and never fetches upstream.
+const HeaderDisableModuleFetch = "Disable-Module-Fetch"
+
+// ErrFetchDisabled is returned by ServerOps when a fetch is required to
+// answer a request but module fetching is disabled for that request.
+// The Server maps it to "410 Gone" with a Disable-Module-Fetch header.
+var ErrFetchDisabled = errors.New("module fetch is disabled")
+
+type fetchDisabledKey struct{}
+
+// WithFetchDisabled marks ctx as a cache-only (no fetch) context.
+func WithFetchDisabled(ctx context.Context, v bool) context.Context {
+	if !v {
+		return ctx
+	}
+	return context.WithValue(ctx, fetchDisabledKey{}, true)
+}
+
+// FetchDisabled reports whether ctx is marked with WithFetchDisabled.
+func FetchDisabled(ctx context.Context) bool {
+	v, _ := ctx.Value(fetchDisabledKey{}).(bool)
+	return v
+}
 
 // A ServerOps provides the external operations
 // (accessing module information and so on) needed by the Server.
@@ -109,12 +133,14 @@ type File interface {
 // All recognized requests to the server contain the substring "/@v/" in the URL.
 // The server will respond with an http.StatusBadRequest (400) error to unrecognized requests.
 type Server struct {
-	ops ServerOps
+	ops   ServerOps
+	sumdb http.Handler
 }
 
 // NewServer returns a new Server using the given operations.
-func NewServer(ops ServerOps) *Server {
-	return &Server{ops: ops}
+// sumdbHandler serves /sumdb/... requests; nil disables sumdb serving.
+func NewServer(ops ServerOps, sumdbHandler http.Handler) *Server {
+	return &Server{ops: ops, sumdb: sumdbHandler}
 }
 
 // ServeHTTP is the server's implementation of http.Handler.
@@ -127,7 +153,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// sumdb handler
 	if strings.HasPrefix(r.URL.Path, "/sumdb/") {
-		sumdb.Handler(w, r)
+		if s.sumdb == nil {
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte("unsupported db\n"))
+			return
+		}
+		s.sumdb.ServeHTTP(w, r)
 		return
 	}
 
@@ -195,6 +226,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if openErr != nil {
+		if errors.Is(openErr, ErrFetchDisabled) {
+			w.Header().Set(HeaderDisableModuleFetch, "true")
+			http.Error(w, ErrFetchDisabled.Error(), http.StatusGone)
+			return
+		}
 		code := http.StatusInternalServerError
 		if errors.Is(openErr, fs.ErrNotExist) {
 			code = http.StatusNotFound
@@ -213,6 +249,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", ctype)
+	if cc := cacheControlFor(r.URL.Path); cc != "" {
+		w.Header().Set("Cache-Control", cc)
+	}
+	if FetchDisabled(ctx) {
+		w.Header().Set(HeaderDisableModuleFetch, "true")
+	}
 	http.ServeContent(w, r, what, info.ModTime(), f)
 }
 

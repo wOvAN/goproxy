@@ -63,13 +63,33 @@ NOTE: Patterns are matched to the full path specified, not only to the host comp
 
 ### SumDB Proxy
 
-By default, sumdb (Checksum Database) requests use the same proxy host specified by the `-proxy` flag. You can specify a different sumdb proxy using the `-sumdbProxy` flag:
+By default, sumdb (Checksum Database) requests are sent directly to the built-in mirrors of the requested database (`sum.golang.org`, `sum.golang.google.cn`, `gosum.io`). Mirrors are tried in order and the first successful response wins; content-addressed requests (`tile/...`, `lookup/...`) are cached under the cache dir and served from there later. You can route all sumdb requests through a specific host using the `-sumdbProxy` flag:
 
 ```shell
 ./bin/goproxy -listen=0.0.0.0:80 -proxy https://goproxy.io -sumdbProxy https://goproxy.cn
 ```
 
 When the `-sumdbProxy` flag is set, all sumdb requests (including `sum.golang.org`, `sum.golang.google.cn`, and `gosum.io`) will be proxied through the specified host.
+
+### Cache-only mode (Disable-Module-Fetch)
+
+To serve requests strictly from the local cache, without ever fetching upstream, send the request header `Disable-Module-Fetch: true`:
+
+```shell
+curl -H 'Disable-Module-Fetch: true' http://127.0.0.1:8081/github.com/gorilla/mux/@v/list
+```
+
+Cached content is served (for module lists and `@latest` even past their cache expiry, since there is nothing to refresh from); anything not in the cache is answered with `410 Gone` and a `Disable-Module-Fetch: true` response header. The flag `-disableModuleFetch` enables the mode for all requests, and the header is echoed on served responses.
+
+### Cache garbage collection
+
+The download cache grows unbounded by default: cached module files and sumdb entries are immutable and never expire on disk. To enable periodic cleanup, set `-gcInterval` (it is `0`, disabled, by default). Every interval, files in the cache whose **last access time** is older than `-gcKeep` (default 14 days) are deleted, and directories that became empty are pruned:
+
+```shell
+./bin/goproxy -listen=0.0.0.0:80 -cacheDir=/var/lib/goproxy -gcInterval=1h -gcKeep=720h
+```
+
+The sweep is safe against a running proxy: freshly fetched files have a recent access time, and non-empty directories are never removed.
 
 ### Private module authentication
 
