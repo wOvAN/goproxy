@@ -17,10 +17,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/goproxyio/goproxy/v2/renameio"
+	"golang.org/x/mod/module"
+	"golang.org/x/mod/sumdb/tlog"
 )
 
 // supportedSumDB maps a sumdb name to its upstream hosts, in priority
@@ -34,8 +37,9 @@ var supportedSumDB = map[string][]string{
 var (
 	errSumPathInvalid = errors.New("sumdb request path invalid")
 
-	// sumdbHostTimeout bounds each single upstream attempt.
-	sumdbHostTimeout = 2 * time.Second
+	// sumdbHostTimeout bounds each single upstream attempt, body read
+	// included (tiles are a few KB over TLS).
+	sumdbHostTimeout = 10 * time.Second
 )
 
 // A Handler serves /sumdb/<db>/... requests by proxying the supported
@@ -60,6 +64,12 @@ func NewHandler(downloadRoot string, fetchDisabled bool) *Handler {
 
 // ServeHTTP implements http handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	whichDB, rawPath, err := parsePath(r.URL.Path)
 	if _, supported := supportedSumDB[whichDB]; err != nil || !supported {
 		w.WriteHeader(http.StatusGone)
@@ -70,10 +80,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Rebuild the on-disk/upstream path from the validated db name and a
 	// rooted-cleaned path, so ".." segments cannot escape the cache dir.
 	p := strings.TrimPrefix(path.Clean("/"+rawPath), "/")
-	if p == "" || p == "." {
-		http.Error(w, errSumPathInvalid.Error(), http.StatusBadRequest)
-		return
-	}
 
 	// $GOROOT/src/cmd/go/internal/modfetch/sumdb.go@initBase
 	// > Before accessing any checksum database URL using a proxy, the proxy
@@ -84,69 +90,137 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject any path that is not a valid sumdb protocol path before it can
+	// reach the cache dir or an upstream.
+	if err := validatePath(p); err != nil {
+		http.Error(w, errSumPathInvalid.Error(), http.StatusNotFound)
+		return
+	}
+
 	// Tiles and lookups are content-addressed (immutable) and cacheable;
 	// latest is volatile and is never cached.
 	cacheable := strings.HasPrefix(p, "tile/") || strings.HasPrefix(p, "lookup/")
 	if cacheable && h.serveCache(w, r, whichDB, p) {
 		return
 	}
-	if h.fetchDisabled || r.Header.Get("Disable-Module-Fetch") == "true" {
+	if fetchDisabled(r, h.fetchDisabled) {
 		w.Header().Set("Disable-Module-Fetch", "true")
 		http.Error(w, "module fetch is disabled", http.StatusGone)
 		return
 	}
 
-	var first *http.Response
+	var (
+		firstSeen   bool
+		firstStatus int
+		firstData   []byte
+	)
 	for _, host := range supportedSumDB[whichDB] {
-		resp, err := h.fetch(r.Context(), host, p)
+		status, data, err := h.fetch(r.Context(), host, p)
 		if err != nil {
 			log.Printf("[sumdb] proxy request to %s%s failed: %v\n", host, p, err)
 			continue
 		}
-		if resp.StatusCode == http.StatusOK {
-			defer func() { _ = resp.Body.Close() }()
-			data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			_ = resp.Body.Close()
-			if err == nil {
-				if cacheable && h.downloadRoot != "" {
-					h.writeCache(whichDB, p, data)
-				}
-				respondSumdb(w, http.StatusOK, p, data)
-				return
+		// An empty 200 body is a broken mirror, not a valid record:
+		// fall through to the next host.
+		if status == http.StatusOK && len(data) > 0 {
+			if cacheable && h.downloadRoot != "" {
+				h.writeCache(whichDB, p, data)
 			}
-			resp.Body.Close()
-			first = resp
-			continue
+			respondSumdb(w, http.StatusOK, p, data)
+			return
 		}
-		if first == nil {
-			first = resp
-		} else {
-			_ = resp.Body.Close()
+		if !firstSeen {
+			firstSeen, firstStatus, firstData = true, status, data
 		}
 	}
-	if first != nil {
-		defer func() { _ = first.Body.Close() }()
-		data, _ := io.ReadAll(io.LimitReader(first.Body, 1<<20))
-		respondSumdb(w, first.StatusCode, p, data)
+	if firstSeen {
+		if firstStatus == http.StatusOK {
+			http.Error(w, "empty sumdb response", http.StatusBadGateway)
+			return
+		}
+		respondSumdb(w, firstStatus, p, firstData)
 		return
 	}
 	http.Error(w, "all sumdb upstreams failed", http.StatusGone)
 }
 
-func (h *Handler) fetch(ctx context.Context, host, p string) (*http.Response, error) {
+// fetchDisabled reports whether this request must be answered from the cache
+// only (global flag or Disable-Module-Fetch request header).
+func fetchDisabled(r *http.Request, global bool) bool {
+	v, _ := strconv.ParseBool(r.Header.Get("Disable-Module-Fetch"))
+	return global || v
+}
+
+// validatePath checks that a cleaned sumdb sub-path is one of the protocol's
+// paths, and that tile and lookup paths are well formed (valid, canonical
+// module coordinates; bounded tile level), so garbage never reaches the cache
+// dir and never hits the mirrors.
+func validatePath(p string) error {
+	switch {
+	case p == "latest":
+		return nil
+	case strings.HasPrefix(p, "lookup/"):
+		escPath, escVersion, ok := strings.Cut(strings.TrimPrefix(p, "lookup/"), "@")
+		if !ok {
+			return errSumPathInvalid
+		}
+		mp, err := module.UnescapePath(escPath)
+		if err != nil {
+			return err
+		}
+		vers, err := module.UnescapeVersion(escVersion)
+		if err != nil {
+			return err
+		}
+		if err := module.Check(mp, vers); err != nil {
+			return err
+		}
+		if vers != module.CanonicalVersion(vers) {
+			return errSumPathInvalid
+		}
+		return nil
+	case strings.HasPrefix(p, "tile/"):
+		// maxTileLevel is the maximum level documented by tlog.Tile,
+		// which tlog.ParseTilePath does not enforce.
+		const maxTileLevel = 63
+		tile, err := tlog.ParseTilePath(p)
+		if err != nil {
+			return err
+		}
+		if tile.L > maxTileLevel {
+			return errSumPathInvalid
+		}
+		return nil
+	default:
+		return errSumPathInvalid
+	}
+}
+
+// fetch fetches p from one sumdb host. The body is read here, under the
+// per-host context, so it is complete before the context is cancelled.
+func (h *Handler) fetch(ctx context.Context, host, p string) (int, []byte, error) {
 	urlPath, err := url.Parse(host)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	urlPath.Path = strings.TrimSuffix(urlPath.Path, "/") + "/" + p
 	ctx, cancel := context.WithTimeout(ctx, sumdbHostTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlPath.String(), nil)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	log.Printf("[sumdb] proxy request to: %s\n", urlPath.String())
-	return http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, data, nil
 }
 
 // cachePath returns the download-cache file for a sumdb path.
@@ -169,7 +243,7 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, db, p strin
 	if err != nil {
 		return false
 	}
-	if h.fetchDisabled || r.Header.Get("Disable-Module-Fetch") == "true" {
+	if fetchDisabled(r, h.fetchDisabled) {
 		w.Header().Set("Disable-Module-Fetch", "true")
 	}
 	w.Header().Set("Cache-Control", "public, max-age=604800")

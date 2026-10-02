@@ -145,6 +145,12 @@ func NewServer(ops ServerOps, sumdbHandler http.Handler) *Server {
 
 // ServeHTTP is the server's implementation of http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	ctx, err := s.ops.NewContext(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -161,6 +167,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.sumdb.ServeHTTP(w, r)
 		return
 	}
+	// Responses depend on the Disable-Module-Fetch request header.
+	w.Header().Add("Vary", HeaderDisableModuleFetch)
 
 	i := strings.Index(r.URL.Path, "/@")
 	if i < 0 {

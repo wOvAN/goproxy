@@ -61,6 +61,16 @@ NOTE: Patterns are matched to the full path specified, not only to the host comp
 ./bin/goproxy -listen=0.0.0.0:80 -cacheDir=/tmp/test -proxy https://goproxy.io -exclude "*.corp.example.com,rsc.io/private"
 ```
 
+The `-proxy` flag accepts a full `GOPROXY`-style chain, not just one URL:
+
+```shell
+./bin/goproxy -proxy "https://a.example,https://b.example|direct,off"
+```
+
+Entries are tried in order. After a `,` the next entry is tried only when the current one answers "not found" (404/410); after a `|` it is tried on any failure (connection error, 5xx). The chain may end with `direct` (fall back to the local `go` command) and/or `off` (stop; answer from the cache or with the last upstream failure). A single URL (the common case) keeps the streaming reverse-proxy behavior.
+
+When an upstream fetch fails, a previously cached copy of the module file is served when one exists (stale-on-error); upstream responses marked `no-store`/`no-cache`/`must-revalidate`/`private` are passed through without being cached.
+
 ### SumDB Proxy
 
 By default, sumdb (Checksum Database) requests are sent directly to the built-in mirrors of the requested database (`sum.golang.org`, `sum.golang.google.cn`, `gosum.io`). Mirrors are tried in order and the first successful response wins; content-addressed requests (`tile/...`, `lookup/...`) are cached under the cache dir and served from there later. You can route all sumdb requests through a specific host using the `-sumdbProxy` flag:

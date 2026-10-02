@@ -54,7 +54,7 @@ func TestRouterFetchDisabled(t *testing.T) {
 	if resp.Header.Get(HeaderDisableModuleFetch) != "true" {
 		t.Error("cache-only response must echo Disable-Module-Fetch header")
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Cache-only miss: 410, never proxied (the unreachable proxy would
 	// surface as 502 if it were contacted).
@@ -62,14 +62,22 @@ func TestRouterFetchDisabled(t *testing.T) {
 	if resp.StatusCode != http.StatusGone {
 		t.Errorf("cache-only miss status = %d, want 410", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
-	// Normal mode with expired list and dead proxy: not 200 (falls to proxy).
+	// Normal mode with expired list and dead proxy: stale-on-error serves
+	// the cached copy (ErrorHandler falls back to the cache, so no 502).
 	resp = get("github.com/x/y/@v/list", false)
-	if resp.StatusCode == http.StatusOK {
-		t.Error("expired cache with dead proxy must not serve 200 in normal mode")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expired cache with dead proxy: status = %d, want 200 (stale-on-error)", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
+
+	// Normal mode, nothing in cache, dead proxy: 502 from the error handler.
+	resp = get("github.com/x/miss/@v/list", false)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("cache miss with dead proxy: status = %d, want 502", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
 }
 
 func TestContentTypeFor(t *testing.T) {

@@ -31,6 +31,8 @@ func TestHandler(t *testing.T) {
 	t.Run("fallback", testFallback)
 	t.Run("cache", testCache)
 	t.Run("fetchDisabled", testFetchDisabled)
+	t.Run("validate", testValidate)
+	t.Run("emptyUpstream", testEmptyUpstream)
 }
 
 func testSupported(t *testing.T) {
@@ -88,7 +90,7 @@ func testFallback(t *testing.T) {
 	defer s1.Close()
 	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits2++
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	}))
 	defer s2.Close()
 
@@ -146,11 +148,9 @@ func testFallback(t *testing.T) {
 
 func testCache(t *testing.T) {
 	var hits int
-	var lastPath string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		lastPath = r.URL.Path
-		fmt.Fprint(w, "tile-data")
+		_, _ = fmt.Fprint(w, "tile-data")
 	}))
 	defer up.Close()
 
@@ -203,14 +203,16 @@ func testCache(t *testing.T) {
 		t.Errorf("upstream hits after latest = %d, want 2 (latest must not be cached)", hits)
 	}
 
-	// Traversal segments are cleaned into the cache root, not escaped.
+	// Strict path validation: traversal segments clean to "etc/passwd",
+	// which is not a sumdb protocol path → 404, upstream untouched.
+	hitsBefore := hits
 	resp = get("/sumdb/sum.golang.org/lookup/../../../../etc/passwd")
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("traversal status = %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("traversal status = %d, want 404", resp.StatusCode)
 	}
-	if strings.Contains(lastPath, "..") {
-		t.Errorf("upstream path escaped: %q", lastPath)
+	if hits != hitsBefore {
+		t.Errorf("invalid sumdb path hit upstream %d times, want 0", hits-hitsBefore)
 	}
 	if _, err := os.Stat(filepath.Join(root, "etc")); err == nil {
 		t.Error("traversal wrote outside the sumdb cache dir")
@@ -221,7 +223,7 @@ func testFetchDisabled(t *testing.T) {
 	var hits int
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		fmt.Fprint(w, "d")
+		_, _ = fmt.Fprint(w, "d")
 	}))
 	defer up.Close()
 
@@ -266,6 +268,91 @@ func testFetchDisabled(t *testing.T) {
 	if hits != 0 {
 		t.Errorf("cache-only mode touched upstream %d times, want 0", hits)
 	}
+}
+
+// testValidate pins strict sumdb path validation: malformed tile/lookup
+// paths never reach the cache dir or an upstream.
+func testValidate(t *testing.T) {
+	var hits int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = fmt.Fprint(w, "data")
+	}))
+	defer up.Close()
+
+	root := t.TempDir()
+	useTestUpstreams(t, "sum.golang.org", up.URL)
+	h := NewHandler(root, false)
+
+	get := func(path string) *http.Response {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "https://goproxy.io"+path, nil)
+		h.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	for _, path := range []string{
+		"/sumdb/sum.golang.org/lookup/github.com/x/y",    // no @version
+		"/sumdb/sum.golang.org/lookup/github.com/x/y@v1", // non-canonical version
+		"/sumdb/sum.golang.org/lookup/github.com/x/y@latest",
+		"/sumdb/sum.golang.org/tile/garbage",
+		"/sumdb/sum.golang.org/tile/0/0/000",  // height 0 not a valid tile
+		"/sumdb/sum.golang.org/tile/1/64/000", // tile level too deep
+		"/sumdb/sum.golang.org/nonsense",
+	} {
+		resp := get(path)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404", path, resp.StatusCode)
+		}
+		_ = resp.Body.Close()
+	}
+	if hits != 0 {
+		t.Errorf("invalid paths hit upstream %d times, want 0", hits)
+	}
+	if entries, err := os.ReadDir(root); err == nil && len(entries) > 0 {
+		t.Errorf("invalid paths wrote into cache dir: %v", entries)
+	}
+
+	// Well-formed paths pass validation and reach upstream.
+	resp := get("/sumdb/sum.golang.org/tile/1/0/000")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || hits != 1 {
+		t.Errorf("valid tile: status = %d, hits = %d, want 200/1", resp.StatusCode, hits)
+	}
+}
+
+// testEmptyUpstream: an empty 200 body is a broken mirror — the handler must
+// fall through to the next host, and 502 when all mirrors are empty.
+func testEmptyUpstream(t *testing.T) {
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer empty.Close()
+	full := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "record")
+	}))
+	defer full.Close()
+
+	useTestUpstreams(t, "sum.golang.org", empty.URL, full.URL)
+	h := NewHandler(t.TempDir(), false)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/lookup/github.com/x/y@v1.0.0", nil)
+	h.ServeHTTP(rec, req)
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("empty-first fallback status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	// All mirrors empty: 502. A fresh handler (unprimed cache) must fetch.
+	useTestUpstreams(t, "sum.golang.org", empty.URL)
+	h2 := NewHandler(t.TempDir(), false)
+	rec = httptest.NewRecorder()
+	h2.ServeHTTP(rec, req)
+	resp = rec.Result()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("all-empty status = %d, want 502", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
 }
 
 func TestParsePath(t *testing.T) {

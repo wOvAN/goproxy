@@ -65,7 +65,7 @@ func TestFetchDisabled(t *testing.T) {
 		t.Error("cache-only response must echo Disable-Module-Fetch header")
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if strings.TrimSpace(string(body)) != "v1.0.0" {
 		t.Errorf("cached list body = %q, want v1.0.0", body)
 	}
@@ -75,7 +75,7 @@ func TestFetchDisabled(t *testing.T) {
 		t.Errorf("cached @latest status = %d, want 200", resp.StatusCode)
 	}
 	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if !strings.Contains(string(body), "v1.0.0") {
 		t.Errorf("@latest body = %q, want latest from cached list", body)
 	}
@@ -84,7 +84,7 @@ func TestFetchDisabled(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("cached info status = %d, want 200", resp.StatusCode)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Cache-only miss: 410 with the header, no go command run.
 	resp = get("example.com/other/@v/list", true)
@@ -94,5 +94,5 @@ func TestFetchDisabled(t *testing.T) {
 	if resp.Header.Get(proxy.HeaderDisableModuleFetch) != "true" {
 		t.Error("cache-only miss must carry Disable-Module-Fetch header")
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }

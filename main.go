@@ -30,6 +30,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -63,7 +64,7 @@ func setup() {
 	var showVersion bool
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.StringVar(&excludeHost, "exclude", "", "exclude host pattern, you can exclude internal Git services")
-	flag.StringVar(&proxyHost, "proxy", "", "next hop proxy for Go Modules, recommend use https://goproxy.io")
+	flag.StringVar(&proxyHost, "proxy", "", `next hop proxy for Go Modules, a GOPROXY-style chain: "url1,url2|url3,direct,off"; ',' falls back on not-exist, '|' on any failure; "direct"/"off" may end the chain`)
 	flag.StringVar(&sumdbProxy, "sumdbProxy", "", "sumdb proxy host; empty (default) races the built-in sumdb mirrors directly")
 	flag.StringVar(&cacheDir, "cacheDir", "", "Go Modules cache dir, default is $GOPATH/pkg/mod/cache/download")
 	flag.StringVar(&listen, "listen", "0.0.0.0:8081", "service listen address")
@@ -255,7 +256,8 @@ type ops struct{}
 // NewContext creates a context.
 func (*ops) NewContext(r *http.Request) (context.Context, error) {
 	ctx := context.Background()
-	if disableModuleFetch || r.Header.Get(proxy.HeaderDisableModuleFetch) == "true" {
+	v, _ := strconv.ParseBool(r.Header.Get(proxy.HeaderDisableModuleFetch))
+	if disableModuleFetch || v {
 		ctx = proxy.WithFetchDisabled(ctx, true)
 	}
 	return ctx, nil
@@ -273,6 +275,10 @@ func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
 	}
 	data, err := fetchList(mpath)
 	if err != nil {
+		// Stale-on-error: a failed refresh serves the cached list at any age.
+		if f, cerr := openCached(file); cerr == nil {
+			return f, nil
+		}
 		return nil, err
 	}
 	return proxy.MemFile(data, time.Now()), nil
@@ -330,6 +336,10 @@ func (*ops) Latest(ctx context.Context, path string) (proxy.File, error) {
 	}
 	d, err := download(module.Version{Path: path, Version: "latest"})
 	if err != nil {
+		// Stale-on-error: a failed fetch serves the cached latest, if any.
+		if f, cerr := latestFromCache(path); cerr == nil {
+			return f, nil
+		}
 		return nil, err
 	}
 	return os.Open(d.Info)
