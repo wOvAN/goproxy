@@ -623,3 +623,37 @@ func resp0(resp *http.Response) int {
 	defer func() { _ = resp.Body.Close() }()
 	return resp.StatusCode
 }
+
+// TestInsecure covers SetInsecure: sumdb upstream TLS certificates are
+// verified by default; SetInsecure(true) skips verification.
+func TestInsecure(t *testing.T) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "tile-bytes")
+	}))
+	defer up.Close()
+	useTestUpstreams(t, "sum.golang.org", up.URL)
+
+	t.Cleanup(func() { httpClient = http.DefaultClient })
+	root := t.TempDir()
+
+	h := NewHandler(root, false)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/tile/1/0/000", nil)
+	h.ServeHTTP(rec, req)
+	resp := rec.Result()
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusGone {
+		t.Errorf("verified TLS upstream: status = %d, want 410 (untrusted certificate must fail)", resp.StatusCode)
+	}
+
+	SetInsecure(true)
+	h = NewHandler(root, false)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "https://goproxy.io/sumdb/sum.golang.org/tile/1/0/000", nil)
+	h.ServeHTTP(rec, req)
+	resp = rec.Result()
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("SetInsecure: status = %d, want 200", resp.StatusCode)
+	}
+}

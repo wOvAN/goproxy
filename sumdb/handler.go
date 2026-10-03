@@ -8,6 +8,7 @@ package sumdb
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -40,7 +41,21 @@ var (
 	// sumdbHostTimeout bounds each single upstream attempt, body read
 	// included (tiles are a few KB over TLS).
 	sumdbHostTimeout = 10 * time.Second
+
+	// httpClient fetches sumdb upstreams; swapped by SetInsecure.
+	httpClient = http.DefaultClient
 )
+
+// SetInsecure disables upstream TLS certificate verification for sumdb
+// fetches (mirrors the router's -insecure flag).
+func SetInsecure(insecure bool) {
+	if !insecure {
+		return
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	httpClient = &http.Client{Transport: tr}
+}
 
 // A Handler serves /sumdb/<db>/... requests by proxying the supported
 // checksum databases. Content-addressed paths (tile/... and lookup/...)
@@ -211,7 +226,7 @@ func (h *Handler) fetch(ctx context.Context, host, p string) (int, []byte, error
 		return 0, nil, err
 	}
 	logger.Info("sumdb: proxy request", "url", urlPath.String())
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}

@@ -34,6 +34,7 @@ runtime defaults.
 | `-connectTimeout` | duration | `30s` | Dial timeout for upstream (proxy/sumdb) connections |
 | `-fetchTimeout` | duration | `10m` | Max time a single request may take (`0` = no limit) |
 | `-tempDir` | string | *(empty)* = `$TMPDIR` | Dir for upstream stream-through temp files |
+| `-insecure` | bool | `false` | Skip upstream TLS certificate verification |
 | `-version` | bool | `false` | Print the build version and exit |
 
 ---

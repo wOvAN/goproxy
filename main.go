@@ -64,6 +64,7 @@ var maxConcurrentFetches int
 var connectTimeout time.Duration
 var fetchTimeout time.Duration
 var tempDir string
+var insecure bool
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
@@ -91,6 +92,7 @@ func setup() {
 	flag.DurationVar(&fetchTimeout, "fetchTimeout", 10*time.Minute, "maximum time a single request may take; 0 means no limit")
 	flag.StringVar(&tempDir, "tempDir", "", "directory for upstream stream-through temp files; default is $TMPDIR")
 	flag.StringVar(&sumdbCustom, "sumdb", "", `extra proxied checksum databases: "name url,name2 url2" (url optional, defaults to https://name)`)
+	flag.BoolVar(&insecure, "insecure", false, "allow insecure TLS connections to upstream proxies and sumdb mirrors")
 	flag.Parse()
 
 	if maxConcurrentFetches > 0 {
@@ -149,6 +151,10 @@ func main() {
 	if disableModuleFetch {
 		logger.Info("module fetch disabled: serving from cache only")
 	}
+	if insecure {
+		logger.Warn("insecure TLS: upstream certificate verification disabled")
+		sumdb.SetInsecure(true)
+	}
 	sumdbHandler := sumdb.NewHandler(downloadRoot, disableModuleFetch)
 
 	if proxyHost != "" {
@@ -165,6 +171,7 @@ func main() {
 			DisableModuleFetch: disableModuleFetch,
 			DialTimeout:        connectTimeout,
 			TempDir:            tempDir,
+			Insecure:           insecure,
 		})}
 	} else {
 		handle = &requestLogger{proxy.MetricsMiddleware("direct", proxy.NewServer(new(ops), sumdbHandler))}

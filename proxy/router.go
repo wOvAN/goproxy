@@ -36,6 +36,8 @@ type RouterOptions struct {
 	DisableModuleFetch bool
 	// DialTimeout bounds establishing upstream connections (0: library default).
 	DialTimeout time.Duration
+	// Insecure skips upstream TLS certificate verification.
+	Insecure bool
 	// TempDir holds stream-through upstream copies ("" = os.TempDir).
 	TempDir string
 }
@@ -133,7 +135,7 @@ func (router *Router) customModResponse(r *http.Response) error {
 		if err != nil {
 			return fmt.Errorf("failed to parse Location header %q: %v", loc, err)
 		}
-		resp, err := http.Get(r.Request.URL.ResolveReference(u).String())
+		resp, err := router.chainClient.Get(r.Request.URL.ResolveReference(u).String())
 		if err != nil {
 			return err
 		}
@@ -249,12 +251,15 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 			return rt
 		}
 		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		if opts.Insecure {
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
 		transport.MaxIdleConnsPerHost = 100
 		transport.ResponseHeaderTimeout = 30 * time.Second
 		if opts.DialTimeout > 0 {
 			transport.DialContext = (&net.Dialer{Timeout: opts.DialTimeout, KeepAlive: 30 * time.Second}).DialContext
 		}
+		rt.chainClient = &http.Client{Transport: transport}
 
 		if len(steps) == 1 && tail == "" && (steps[0].u.Scheme == "http" || steps[0].u.Scheme == "https") {
 			// Single upstream: stream through a reverse proxy (no buffering).
@@ -286,7 +291,6 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 		}
 		rt.chain = steps
 		rt.tail = tail
-		rt.chainClient = &http.Client{Transport: transport}
 		for i := range rt.chain {
 			st := &rt.chain[i]
 			if st.u.Scheme == "file" {

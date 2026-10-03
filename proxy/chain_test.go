@@ -412,3 +412,39 @@ func TestRouterChainFile(t *testing.T) {
 		t.Errorf("file step traversal: served %q from outside the seed dir", body)
 	}
 }
+
+// TestRouterInsecure pins the -insecure semantics: upstream TLS certificates
+// are verified by default (an untrusted chain fails the fetch), and
+// RouterOptions.Insecure skips verification.
+func TestRouterInsecure(t *testing.T) {
+	tlsUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("v1.0.0\n"))
+	}))
+	defer tlsUpstream.Close()
+
+	get := func(rt *Router, path string) (int, string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://proxy/"+path, nil)
+		rt.ServeHTTP(rec, req)
+		resp := rec.Result()
+		body, _ := readAll(resp.Body)
+		return resp.StatusCode, body
+	}
+
+	rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+		Proxy:        tlsUpstream.URL,
+		DownloadRoot: t.TempDir(),
+	})
+	if status, _ := get(rt, "github.com/x/tls/@v/list"); status != http.StatusBadGateway {
+		t.Errorf("verified TLS upstream: status = %d, want 502 (untrusted certificate must fail)", status)
+	}
+
+	rt = NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+		Proxy:        tlsUpstream.URL,
+		DownloadRoot: t.TempDir(),
+		Insecure:     true,
+	})
+	if status, body := get(rt, "github.com/x/tls/@v/list"); status != http.StatusOK || body != "v1.0.0\n" {
+		t.Errorf("Insecure upstream: status = %d, body = %q, want 200/v1.0.0", status, body)
+	}
+}
