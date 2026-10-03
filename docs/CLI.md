@@ -23,7 +23,7 @@ runtime defaults.
 | `-cacheExpire` | duration | `5m` | TTL for cached `list` files and `@latest` |
 | `-disableModuleFetch` | bool | `false` | Serve from cache only; never fetch upstream |
 | `-gcInterval` | duration | `0` (off) | Cache GC interval |
-| `-gcKeep` | duration | `14d` | Age (since last access) at which GC deletes a cache file |
+| `-gcKeep` | duration | `336h` (14d) | Age (since last access) at which GC deletes a cache file |
 | `-sumdb` | string | *(empty)* | Extra proxied checksum databases |
 | `-sumdbProxy` | string | *(empty)* | Route all sumdb requests through this host |
 | `-tlsCert` | string | *(empty)* | TLS certificate file (with `-tlsKey` → HTTPS) |
@@ -92,8 +92,9 @@ upstream is ever invoked. A cache miss returns `410 Gone` with a
 Periodic atime-based garbage collection of the download cache.
 - `-gcInterval 0` (default) disables GC entirely.
 - Every interval, files whose **last access time** is older than `-gcKeep`
-  (default `14d`) are deleted, then directories that became empty are pruned
-  deepest-first. The cache root and non-empty dirs are never removed.
+  (default `336h`, i.e. 14 days) are deleted, then directories that became
+  empty are pruned deepest-first. The cache root and non-empty dirs are never
+  removed.
 - Only the download cache is scanned (`…/cache/download`); the git/VCS cache
   under `…/cache/vcs` is untouched.
 - Safe against a running proxy: freshly fetched files have a recent atime.
