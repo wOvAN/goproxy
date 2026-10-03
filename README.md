@@ -67,9 +67,37 @@ The `-proxy` flag accepts a full `GOPROXY`-style chain, not just one URL:
 ./bin/goproxy -proxy "https://a.example,https://b.example|direct,off"
 ```
 
-Entries are tried in order. After a `,` the next entry is tried only when the current one answers "not found" (404/410); after a `|` it is tried on any failure (connection error, 5xx). The chain may end with `direct` (fall back to the local `go` command) and/or `off` (stop; answer from the cache or with the last upstream failure). A single URL (the common case) keeps the streaming reverse-proxy behavior.
+Entries are tried in order. After a `,` the next entry is tried only when the current one answers "not found" (404/410); after a `|` it is tried on any failure (connection error, 5xx). The chain may end with `direct` (fall back to the local `go` command) or `off` (stop; answer from the cache or with the last upstream failure), as the single last entry. A single URL (the common case) keeps the streaming reverse-proxy behavior. A chain entry may also be `file:///path/to/dir` — a local directory in the download-cache layout, served as an offline mirror. Chain entries that answer `429`/`5xx` are retried up to twice (short `Retry-After` delays are honored).
 
-When an upstream fetch fails, a previously cached copy of the module file is served when one exists (stale-on-error); upstream responses marked `no-store`/`no-cache`/`must-revalidate`/`private` are passed through without being cached.
+When an upstream fetch fails, a previously cached copy of the module file is served when one exists (stale-on-error); upstream responses marked `no-store`/`no-cache`/`must-revalidate`/`private`/`proxy-revalidate`/`s-maxage`/`max-age=0`/`Vary: *` are passed through without being cached.
+
+### Custom checksum databases
+
+By default the built-in sum databases (`sum.golang.org`, `sum.golang.google.cn`, `gosum.io`) are proxied. To proxy additional (e.g. private) checksum databases, use the `-sumdb` flag:
+
+```shell
+./bin/goproxy -proxy https://goproxy.io -sumdb "sumdb.corp.example.com https://sumdb.corp.example.com/"
+```
+
+Each entry is `name` or `name url` (space-separated; url defaults to `https://name`), entries are comma-separated. Requests to `/sumdb/<name>/...` are served from that url and cached like the built-in databases.
+
+### TLS, health check, other flags
+
+Serve HTTPS by passing a certificate and key:
+
+```shell
+./bin/goproxy -listen=0.0.0.0:443 -tlsCert=/etc/ssl/goproxy.crt -tlsKey=/etc/ssl/goproxy.key
+```
+
+`GET /healthz` answers `204 No Content` (liveness probes). With `-pathPrefix /prefix`, all routes (module protocol, `/metrics`, `/healthz`) are served under that prefix.
+
+Other flags:
+
+- `-goBin` (default `go`) — the go binary used for direct fetches.
+- `-maxConcurrentFetches` (default 0 = 2*NumCPU) — cap on concurrent direct fetches.
+- `-connectTimeout` (default 30s) — dial timeout for upstream connections.
+- `-fetchTimeout` (default 10m, 0 = unlimited) — maximum time a single request may take.
+- `-tempDir` — directory for stream-through upstream temp files (default `$TMPDIR`).
 
 ### SumDB Proxy
 

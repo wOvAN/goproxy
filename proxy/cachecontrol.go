@@ -17,14 +17,14 @@ import (
 // get the list cache expiry; sumdb latest is volatile; supported is a
 // probe endpoint and must never be cached.
 func cacheControlFor(urlPath string) string {
-	if strings.HasPrefix(urlPath, "/sumdb/") {
+	if after, ok := strings.CutPrefix(urlPath, "/sumdb/"); ok {
 		// /sumdb/<db>/<what>
-		rest := strings.TrimPrefix(urlPath, "/sumdb/")
-		i := strings.Index(rest, "/")
-		if i < 0 {
+		rest := after
+		_, after, ok := strings.Cut(rest, "/")
+		if !ok {
 			return ""
 		}
-		switch what := rest[i+1:]; {
+		switch what := after; {
 		case what == "supported":
 			return "no-store"
 		case what == "latest":
@@ -34,11 +34,11 @@ func cacheControlFor(urlPath string) string {
 		}
 		return ""
 	}
-	i := strings.Index(urlPath, "/@")
-	if i < 0 {
+	_, after, ok := strings.Cut(urlPath, "/@")
+	if !ok {
 		return ""
 	}
-	what := urlPath[i+len("/@"):]
+	what := after
 	switch what {
 	case "latest", "v/list":
 		return publicMaxAge(ListExpire)

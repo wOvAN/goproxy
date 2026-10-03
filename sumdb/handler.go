@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goproxyio/goproxy/v2/logger"
 	"github.com/goproxyio/goproxy/v2/renameio"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/tlog"
@@ -117,7 +117,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, host := range supportedSumDB[whichDB] {
 		status, data, err := h.fetch(r.Context(), host, p)
 		if err != nil {
-			log.Printf("[sumdb] proxy request to %s%s failed: %v\n", host, p, err)
+			logger.Error("sumdb: proxy request failed", "host", host, "path", p, err)
 			continue
 		}
 		// An empty 200 body is a broken mirror, not a valid record:
@@ -210,7 +210,7 @@ func (h *Handler) fetch(ctx context.Context, host, p string) (int, []byte, error
 	if err != nil {
 		return 0, nil, err
 	}
-	log.Printf("[sumdb] proxy request to: %s\n", urlPath.String())
+	logger.Info("sumdb: proxy request", "url", urlPath.String())
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -255,11 +255,11 @@ func (h *Handler) serveCache(w http.ResponseWriter, r *http.Request, db, p strin
 func (h *Handler) writeCache(db, p string, data []byte) {
 	file := h.cachePath(db, p)
 	if err := os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
-		log.Printf("[sumdb] make cache dir failed: %v\n", err)
+		logger.Error("sumdb: make cache dir failed", err)
 		return
 	}
 	if err := renameio.WriteToFile(file, bytes.NewReader(data), 0666); err != nil {
-		log.Printf("[sumdb] write cache file failed: %v\n", err)
+		logger.Error("sumdb: write cache file failed", err)
 	}
 }
 
@@ -274,14 +274,34 @@ func respondSumdb(w http.ResponseWriter, status int, p string, data []byte) {
 	_, _ = w.Write(data)
 }
 
+// parsePath splits "/sumdb/<db>/<subpath>" into the proxied db name and the
+// sub-path. Db names may span multiple segments ("corp.example.com/sumdb"),
+// so the longest registered name that matches at a segment boundary wins.
 func parsePath(rawPath string) (whichDB, path string, err error) {
-	parts := strings.SplitN(rawPath, "/", 4)
-	if len(parts) < 4 {
+	const dbPrefix = "/sumdb/"
+	if !strings.HasPrefix(rawPath, dbPrefix) {
 		return "", "", errSumPathInvalid
 	}
-	whichDB = parts[2]
-	path = parts[3]
-	return
+	rest := rawPath[len(dbPrefix):]
+	for name := range supportedSumDB {
+		if len(name) <= len(whichDB) || !strings.HasPrefix(rest, name) {
+			continue
+		}
+		if r := rest[len(name):]; r != "" && r[0] != '/' {
+			continue
+		}
+		whichDB = name
+	}
+	if whichDB == "" {
+		return "", "", errSumPathInvalid
+	}
+	return whichDB, strings.TrimPrefix(rest[len(whichDB):], "/"), nil
+}
+
+// AddProxiedDB registers (or replaces) a proxied checksum database: requests
+// to /sumdb/<name>/... are served from the given upstream base url.
+func AddProxiedDB(name, url string) {
+	supportedSumDB[name] = []string{url}
 }
 
 // SetSumdbProxy rewrites the supported sumdb hosts to route through proxyHost.

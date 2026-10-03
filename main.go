@@ -22,8 +22,8 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"slices"
 
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,6 +36,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/goproxyio/goproxy/v2/logger"
 	"github.com/goproxyio/goproxy/v2/proxy"
 	"github.com/goproxyio/goproxy/v2/renameio"
 	"github.com/goproxyio/goproxy/v2/sumdb"
@@ -49,11 +50,20 @@ var listen string
 var cacheDir string
 var proxyHost string
 var sumdbProxy string
+var sumdbCustom string
 var excludeHost string
 var cacheExpire time.Duration
 var disableModuleFetch bool
 var gcInterval time.Duration
 var gcKeep time.Duration
+var tlsCert string
+var tlsKey string
+var pathPrefix string
+var goBin string
+var maxConcurrentFetches int
+var connectTimeout time.Duration
+var fetchTimeout time.Duration
+var tempDir string
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
@@ -72,7 +82,20 @@ func setup() {
 	flag.BoolVar(&disableModuleFetch, "disableModuleFetch", false, "serve modules and sumdb from the cache only; never fetch upstream")
 	flag.DurationVar(&gcInterval, "gcInterval", 0, "cache garbage collection interval; a cache file untouched for gcKeep is deleted; 0 disables GC")
 	flag.DurationVar(&gcKeep, "gcKeep", 14*24*time.Hour, "cache file age (since last access) to keep during GC")
+	flag.StringVar(&tlsCert, "tlsCert", "", "TLS certificate file; with tlsKey, serve HTTPS")
+	flag.StringVar(&tlsKey, "tlsKey", "", "TLS key file; with tlsCert, serve HTTPS")
+	flag.StringVar(&pathPrefix, "pathPrefix", "", "prefix stripped from all request paths, e.g. /goproxy")
+	flag.StringVar(&goBin, "goBin", "go", "path to the go binary used for direct fetches")
+	flag.IntVar(&maxConcurrentFetches, "maxConcurrentFetches", 0, "maximum concurrent go command subprocesses; 0 means 2*NumCPU")
+	flag.DurationVar(&connectTimeout, "connectTimeout", 30*time.Second, "dial timeout for upstream (proxy/sumdb) connections")
+	flag.DurationVar(&fetchTimeout, "fetchTimeout", 10*time.Minute, "maximum time a single request may take; 0 means no limit")
+	flag.StringVar(&tempDir, "tempDir", "", "directory for upstream stream-through temp files; default is $TMPDIR")
+	flag.StringVar(&sumdbCustom, "sumdb", "", `extra proxied checksum databases: "name url,name2 url2" (url optional, defaults to https://name)`)
 	flag.Parse()
+
+	if maxConcurrentFetches > 0 {
+		goCmdSem = make(chan struct{}, maxConcurrentFetches)
+	}
 
 	if showVersion {
 		fmt.Println(version)
@@ -101,49 +124,89 @@ func setup() {
 
 func main() {
 	setup()
-	log.SetPrefix("goproxy.io: ")
-	log.SetFlags(0)
-	log.Printf("version %s\n", version)
+	logger.Info("version", "version", version)
 
 	var handle http.Handler
 
 	if sumdbProxy != "" {
-		log.Printf("SumDBProxy %s\n", sumdbProxy)
+		logger.Info("sumdb proxy", "proxy", sumdbProxy)
 		sumdb.SetSumdbProxy(sumdbProxy)
 	}
+	if sumdbCustom != "" {
+		for entry := range strings.SplitSeq(sumdbCustom, ",") {
+			parts := strings.Fields(entry)
+			if len(parts) == 0 {
+				continue
+			}
+			url := "https://" + parts[0]
+			if len(parts) > 1 {
+				url = parts[1]
+			}
+			logger.Info("sumdb", "db", parts[0], "url", url)
+			sumdb.AddProxiedDB(parts[0], url)
+		}
+	}
 	if disableModuleFetch {
-		log.Println("module fetch disabled: serving from cache only")
+		logger.Info("module fetch disabled: serving from cache only")
 	}
 	sumdbHandler := sumdb.NewHandler(downloadRoot, disableModuleFetch)
 
 	if proxyHost != "" {
-		log.Printf("ProxyHost %s\n", proxyHost)
+		logger.Info("proxy host", "host", proxyHost)
 		if excludeHost != "" {
-			log.Printf("ExcludeHost %s\n", excludeHost)
+			logger.Info("exclude host", "host", excludeHost)
 		}
-		handle = &logger{proxy.NewRouter(proxy.NewServer(new(ops), sumdbHandler), &proxy.RouterOptions{
+		handle = &requestLogger{proxy.NewRouter(proxy.NewServer(new(ops), sumdbHandler), &proxy.RouterOptions{
 			Pattern:            excludeHost,
 			Proxy:              proxyHost,
 			DownloadRoot:       downloadRoot,
 			CacheExpire:        cacheExpire,
 			Sumdb:              sumdbHandler,
 			DisableModuleFetch: disableModuleFetch,
+			DialTimeout:        connectTimeout,
+			TempDir:            tempDir,
 		})}
 	} else {
-		handle = &logger{proxy.MetricsMiddleware("direct", proxy.NewServer(new(ops), sumdbHandler))}
+		handle = &requestLogger{proxy.MetricsMiddleware("direct", proxy.NewServer(new(ops), sumdbHandler))}
+	}
+
+	// Liveness probe outside the counted handlers; healthz must not land in
+	// the module metrics.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.Handle("/", handle)
+	var root http.Handler = mux
+	if pathPrefix != "" {
+		root = http.StripPrefix(pathPrefix, root)
+	}
+	if fetchTimeout > 0 {
+		inner := root
+		ft := fetchTimeout
+		root = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), ft)
+			defer cancel()
+			inner.ServeHTTP(w, r.WithContext(ctx))
+		})
 	}
 
 	server := &http.Server{
 		Addr:              listen,
-		Handler:           handle,
+		Handler:           root,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			if err != http.ErrServerClosed {
-				log.Fatal(err)
-			}
+		var err error
+		if tlsCert != "" && tlsKey != "" {
+			err = server.ListenAndServeTLS(tlsCert, tlsKey)
+		} else {
+			err = server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			logger.Fatal("server failed", err)
 		}
 	}()
 	if gcInterval > 0 {
@@ -153,14 +216,14 @@ func main() {
 	s := make(chan os.Signal, 1)
 	signal.Notify(s, os.Interrupt, syscall.SIGTERM)
 	<-s
-	log.Println("Making a graceful shutdown...")
+	logger.Info("making a graceful shutdown")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	err := server.Shutdown(ctx)
 	if err != nil {
-		log.Fatalf("Error while shutting down the server: %v", err)
+		logger.Fatal("error while shutting down the server", err)
 	}
-	log.Println("Successful server shutdown.")
+	logger.Info("successful server shutdown")
 }
 
 func getDownloadRoot() string {
@@ -171,12 +234,12 @@ func getDownloadRoot() string {
 		_ = os.Setenv("GOMODCACHE", filepath.Join(cacheDir, "pkg", "mod"))
 		return filepath.Join(cacheDir, "pkg", "mod", "cache", "download")
 	}
-	if err := goJSON(&env, "go", "env", "-json", "GOPATH"); err != nil {
-		log.Fatal(err)
+	if err := goJSON(&env, goBin, "env", "-json", "GOPATH"); err != nil {
+		logger.Fatal("go env GOPATH", err)
 	}
 	list := filepath.SplitList(env.GOPATH)
 	if len(list) == 0 || list[0] == "" {
-		log.Fatalf("missing $GOPATH")
+		logger.Fatal("missing $GOPATH")
 	}
 	_ = os.Setenv("GOMODCACHE", filepath.Join(list[0], "pkg", "mod"))
 	return filepath.Join(list[0], "pkg", "mod", "cache", "download")
@@ -220,8 +283,8 @@ func goJSON(dst any, command ...string) error {
 	return nil
 }
 
-// A logger is an http.Handler that logs traffic to standard error.
-type logger struct {
+// A requestLogger is an http.Handler that logs traffic to standard output.
+type requestLogger struct {
 	h http.Handler
 }
 type responseLogger struct {
@@ -236,7 +299,7 @@ func (r *responseLogger) WriteHeader(code int) {
 }
 
 // ServeHTTP implements http handler.
-func (l *logger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (l *requestLogger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Prometheus metrics
 	if r.URL.Path == "/metrics" {
@@ -247,7 +310,7 @@ func (l *logger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rl := &responseLogger{code: 200, ResponseWriter: w}
 	l.h.ServeHTTP(rl, r)
-	log.Printf("%.3fs %d %s\n", time.Since(start).Seconds(), rl.code, r.URL)
+	logger.Info("request", "duration", time.Since(start).Round(time.Millisecond), "code", rl.code, "path", r.URL.String())
 }
 
 // An ops is a proxy.ServerOps implementation.
@@ -302,7 +365,7 @@ func fetchList(mpath string) ([]byte, error) {
 			Path     string
 			Versions []string
 		}
-		if err := goJSON(&list, "go", "list", "-m", "-json", "-versions", mpath+"@latest"); err != nil {
+		if err := goJSON(&list, goBin, "list", "-m", "-json", "-versions", mpath+"@latest"); err != nil {
 			return nil, err
 		}
 		if list.Path != mpath {
@@ -314,7 +377,7 @@ func fetchList(mpath string) ([]byte, error) {
 		}
 		file := listPath(mpath)
 		if err := os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
-			log.Printf("make cache dir failed, err: %v.", err)
+			logger.Error("make cache dir failed", err)
 			return nil, err
 		}
 		if err := renameio.WriteFile(file, data, 0666); err != nil {
@@ -354,9 +417,9 @@ func latestFromCache(mpath string) (proxy.File, error) {
 	}
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
 	var latest string
-	for i := len(lines) - 1; i >= 0; i-- {
-		if lines[i] != "" {
-			latest = lines[i]
+	for _, line := range slices.Backward(lines) {
+		if line != "" {
+			latest = line
 			break
 		}
 	}
@@ -486,7 +549,7 @@ func doOnce(key string, f func() (any, error)) (any, error) {
 func download(m module.Version) (*downloadInfo, error) {
 	v, err := doOnce(m.String(), func() (any, error) {
 		d := new(downloadInfo)
-		return d, goJSON(d, "go", "mod", "download", "-json", m.String())
+		return d, goJSON(d, goBin, "mod", "download", "-json", m.String())
 	})
 	if err != nil {
 		return nil, err

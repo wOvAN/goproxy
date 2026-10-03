@@ -39,6 +39,9 @@ func TestParseProxyChain(t *testing.T) {
 		{in: " https://a.example ,, https://b.example ", wantURLs: []string{"https://a.example", "https://b.example"}, wantPipe: []bool{false, false}},
 		{in: "direct", wantTail: "direct"}, // tail-only chain: all direct
 		{in: "off", wantTail: "off"},
+		{in: "file:///srv/mirror", wantURLs: []string{"file:///srv/mirror"}, wantPipe: []bool{false}},
+		{in: "file://", wantErr: true},                                    // file needs a path
+		{in: "ftp://a.example", wantErr: true},                            // unsupported scheme
 		{in: "https://a.example,direct,https://b.example", wantErr: true}, // direct not last
 		{in: "a.example", wantErr: true},                                  // scheme-less
 		{in: "", wantErr: true},
@@ -231,26 +234,52 @@ func TestRouterChainAllDead(t *testing.T) {
 }
 
 func TestRouterCacheRestrictedNotCached(t *testing.T) {
-	root := t.TempDir()
-	var hits int
-	up := chainUpstream(http.StatusOK, "v1.0.0\n", http.Header{"Cache-Control": []string{"no-store"}}, &hits)
-	defer up.Close()
+	restricted := []http.Header{
+		{"Cache-Control": []string{"no-store"}},
+		{"Cache-Control": []string{"no-cache, max-age=60"}},
+		{"Cache-Control": []string{"public, max-age=0"}},
+		{"Cache-Control": []string{"s-maxage=60"}},
+		{"Cache-Control": []string{"proxy-revalidate"}},
+		{"Vary": []string{"*"}},
+	}
+	for i, hdr := range restricted {
+		root := t.TempDir()
+		var hits int
+		up := chainUpstream(http.StatusOK, "v1.0.0\n", hdr, &hits)
+		rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+			Proxy:        up.URL,
+			DownloadRoot: root,
+			CacheExpire:  time.Minute,
+		})
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://proxy/github.com/x/y/@v/list", nil)
+		rt.ServeHTTP(rec, req)
+		resp := rec.Result()
+		body, _ := readAll(resp.Body)
+		if resp.StatusCode != http.StatusOK || body != "v1.0.0\n" {
+			t.Errorf("restricted[%d] %v passthrough: status = %d, body = %q", i, hdr, resp.StatusCode, body)
+		}
+		if _, err := os.Stat(filepath.Join(root, "github.com", "x", "y", "@v", "list")); !os.IsNotExist(err) {
+			t.Errorf("restricted[%d] %v: upstream response must not be written to the cache", i, hdr)
+		}
+		up.Close()
+	}
 
-	rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
-		Proxy:        up.URL,
-		DownloadRoot: root,
-		CacheExpire:  time.Minute,
-	})
+	// Control: a plain cacheable 200 IS cached.
+	root := t.TempDir()
+	up := chainUpstream(http.StatusOK, "v1.0.0\n", http.Header{"Cache-Control": []string{"public, max-age=60"}}, nil)
+	defer up.Close()
+	rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{Proxy: up.URL, DownloadRoot: root, CacheExpire: time.Minute})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "http://proxy/github.com/x/y/@v/list", nil)
 	rt.ServeHTTP(rec, req)
 	resp := rec.Result()
-	body, _ := readAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || body != "v1.0.0\n" {
-		t.Errorf("restricted passthrough: status = %d, body = %q", resp.StatusCode, body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("cacheable status = %d, want 200", resp.StatusCode)
 	}
-	if _, err := os.Stat(filepath.Join(root, "github.com", "x", "y", "@v", "list")); !os.IsNotExist(err) {
-		t.Error("cache-restricted upstream response must not be written to the cache")
+	if _, err := os.Stat(filepath.Join(root, "github.com", "x", "y", "@v", "list")); err != nil {
+		t.Errorf("cacheable 200 must be written to the cache: %v", err)
 	}
 }
 
@@ -277,4 +306,109 @@ func TestMethodNotAllowed(t *testing.T) {
 		t.Errorf("server POST status = %d, want 405", resp.StatusCode)
 	}
 	_ = resp.Body.Close()
+}
+
+// TestRouterChainRetryAfter covers chain-step status retries: a short
+// Retry-After is honored and the step is retried; a Retry-After beyond the
+// retry window abandons the step immediately.
+func TestRouterChainRetryAfter(t *testing.T) {
+	var shortHits int
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		shortHits++
+		if shortHits == 1 {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "slow down", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte("v1.0.0\n"))
+	}))
+	defer flaky.Close()
+
+	rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+		Proxy:        flaky.URL + ",off",
+		DownloadRoot: t.TempDir(),
+		CacheExpire:  time.Minute,
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://proxy/github.com/x/ra/@v/list", nil)
+	rt.ServeHTTP(rec, req)
+	resp := rec.Result()
+	body, _ := readAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || body != "v1.0.0\n" {
+		t.Errorf("429 retry: status = %d, body = %q, want 200/v1.0.0", resp.StatusCode, body)
+	}
+	if shortHits != 2 {
+		t.Errorf("429 retry: hits = %d, want 2", shortHits)
+	}
+
+	var longHits int
+	long := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		longHits++
+		w.Header().Set("Retry-After", "3600")
+		http.Error(w, "nope", http.StatusServiceUnavailable)
+	}))
+	defer long.Close()
+	var healthyHits int
+	healthy := chainUpstream(http.StatusOK, "v2.0.0\n", nil, &healthyHits)
+	defer healthy.Close()
+
+	rt = NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+		Proxy:        long.URL + "|" + healthy.URL,
+		DownloadRoot: t.TempDir(),
+		CacheExpire:  time.Minute,
+	})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "http://proxy/github.com/x/ra2/@v/list", nil)
+	rt.ServeHTTP(rec, req)
+	resp = rec.Result()
+	body, _ = readAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || body != "v2.0.0\n" {
+		t.Errorf("long Retry-After: status = %d, body = %q, want 200/v2.0.0", resp.StatusCode, body)
+	}
+	if longHits != 1 {
+		t.Errorf("long Retry-After: first-step hits = %d, want 1 (no retry)", longHits)
+	}
+}
+
+// TestRouterChainFile covers a file:// chain step: a local directory in the
+// download-cache layout serves requests (and its responses get cached), with
+// the served paths contained inside the step's directory.
+func TestRouterChainFile(t *testing.T) {
+	seed := t.TempDir()
+	file := filepath.Join(seed, "github.com", "x", "f", "@v", "list")
+	if err := os.MkdirAll(filepath.Dir(file), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("v3.0.0\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secret, []byte("s"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+		Proxy:        "file://" + seed + ",off",
+		DownloadRoot: root,
+	})
+	get := func(path string) (int, string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://proxy/"+path, nil)
+		rt.ServeHTTP(rec, req)
+		resp := rec.Result()
+		body, _ := readAll(resp.Body)
+		return resp.StatusCode, body
+	}
+
+	if status, body := get("github.com/x/f/@v/list"); status != http.StatusOK || body != "v3.0.0\n" {
+		t.Errorf("file step: status = %d, body = %q, want 200/v3.0.0", status, body)
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "github.com", "x", "f", "@v", "list")); err != nil || string(data) != "v3.0.0\n" {
+		t.Errorf("file step must cache the module file: data=%q err=%v", data, err)
+	}
+	// Traversal must stay inside the seed dir.
+	if status, body := get("../" + filepath.Base(secret)); status == http.StatusOK && strings.Contains(body, "s") {
+		t.Errorf("file step traversal: served %q from outside the seed dir", body)
+	}
 }

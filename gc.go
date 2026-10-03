@@ -6,11 +6,12 @@ package main
 
 import (
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/goproxyio/goproxy/v2/logger"
 )
 
 // runCacheGC periodically sweeps the module download cache, removing files
@@ -23,11 +24,11 @@ import (
 // simply fails to delete and is retried next sweep), and os.Remove only
 // deletes empty directories.
 func runCacheGC() {
-	log.Printf("cache gc: interval %s, keep %s\n", gcInterval, gcKeep)
+	logger.Info("cache gc", "interval", gcInterval, "keep", gcKeep)
 	for range time.NewTicker(gcInterval).C {
 		files, bytes, dirs := sweepCache(downloadRoot, gcKeep)
 		if files > 0 || dirs > 0 {
-			log.Printf("cache gc: removed %d file(s) (%d bytes), %d dir(s)\n", files, bytes, dirs)
+			logger.Info("cache gc: removed", "files", files, "bytes", bytes, "dirs", dirs)
 		}
 	}
 }

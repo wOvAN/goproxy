@@ -7,6 +7,7 @@ package proxy
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 )
@@ -18,6 +19,9 @@ type upstreamStep struct {
 	// tried on any failure; after "," the next step is tried only when this
 	// one answers not-exist (404/410).
 	fallBackOnError bool
+	// client serves this step (nil: the shared chain client). file:// steps
+	// need a per-step transport rooted at the step's directory.
+	client *http.Client
 }
 
 // parseProxyChain parses a GOPROXY-style proxy chain, e.g.
@@ -50,8 +54,22 @@ func parseProxyChain(s string) (steps []upstreamStep, tail string, err error) {
 			return steps, tok, nil
 		}
 		u, err := url.Parse(tok)
-		if err != nil || u.Host == "" {
+		if err != nil {
 			return nil, "", fmt.Errorf("proxy chain: invalid proxy URL %q", tok)
+		}
+		switch u.Scheme {
+		case "http", "https":
+			if u.Host == "" {
+				return nil, "", fmt.Errorf("proxy chain: invalid proxy URL %q", tok)
+			}
+		case "file":
+			// A local directory mirror in the download-cache layout; its
+			// root is the step's path, so a URL host is not used.
+			if u.Path == "" {
+				return nil, "", fmt.Errorf("proxy chain: file proxy URL needs a path: %q", tok)
+			}
+		default:
+			return nil, "", fmt.Errorf("proxy chain: unsupported proxy scheme %q", tok)
 		}
 		steps = append(steps, upstreamStep{u: u, fallBackOnError: sep == "|"})
 	}

@@ -5,7 +5,8 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
+	"math"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goproxyio/goproxy/v2/logger"
 	"github.com/goproxyio/goproxy/v2/renameio"
 )
 
@@ -32,6 +34,10 @@ type RouterOptions struct {
 	Sumdb http.Handler
 	// DisableModuleFetch serves from cache only, globally.
 	DisableModuleFetch bool
+	// DialTimeout bounds establishing upstream connections (0: library default).
+	DialTimeout time.Duration
+	// TempDir holds stream-through upstream copies ("" = os.TempDir).
+	TempDir string
 }
 
 // A Router is the proxy HTTP server,
@@ -48,6 +54,7 @@ type Router struct {
 	downloadRoot string
 	cacheExpire  time.Duration
 	disableFetch bool
+	tempDir      string
 }
 
 // fetchDisabled reports whether this request must be answered from the
@@ -57,12 +64,28 @@ func (rt *Router) fetchDisabled(r *http.Request) bool {
 	return rt.disableFetch || v
 }
 
-// cacheRestricted reports whether an upstream response forbids being cached.
+// cacheRestricted reports whether an upstream response forbids being cached:
+// revalidation-required or private Cache-Control, an expired max-age, or a
+// Vary: * response. max-age is matched as a whole token so that max-age=60 is
+// not confused with max-age=0; quoted directive arguments are not parsed
+// (ponytail: upstreams do not quote them in practice).
 func cacheRestricted(h http.Header) bool {
-	cc := strings.ToLower(h.Get("Cache-Control"))
-	for _, d := range []string{"no-store", "no-cache", "must-revalidate", "private"} {
+	cc := strings.ToLower(strings.Join(h.Values("Cache-Control"), ","))
+	for _, d := range []string{"no-store", "no-cache", "must-revalidate", "private", "proxy-revalidate", "s-maxage"} {
 		if strings.Contains(cc, d) {
 			return true
+		}
+	}
+	for tok := range strings.SplitSeq(cc, ",") {
+		if strings.TrimSpace(tok) == "max-age=0" {
+			return true
+		}
+	}
+	for _, v := range h.Values("Vary") {
+		for name := range strings.SplitSeq(v, ",") {
+			if strings.TrimSpace(name) == "*" {
+				return true
+			}
 		}
 	}
 	return false
@@ -215,21 +238,25 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 		rt.downloadRoot = opts.DownloadRoot
 		rt.cacheExpire = opts.CacheExpire
 		rt.disableFetch = opts.DisableModuleFetch
+		rt.tempDir = opts.TempDir
 		if opts.Proxy == "" {
-			log.Printf("not set proxy, all direct.")
+			logger.Info("not set proxy, all direct")
 			return rt
 		}
 		steps, tail, err := parseProxyChain(opts.Proxy)
 		if err != nil {
-			log.Printf("parse proxy chain %q failed: %v, all direct.", opts.Proxy, err)
+			logger.Error("parse proxy chain failed, all direct", "proxy", opts.Proxy, err)
 			return rt
 		}
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 		transport.MaxIdleConnsPerHost = 100
 		transport.ResponseHeaderTimeout = 30 * time.Second
+		if opts.DialTimeout > 0 {
+			transport.DialContext = (&net.Dialer{Timeout: opts.DialTimeout, KeepAlive: 30 * time.Second}).DialContext
+		}
 
-		if len(steps) == 1 && tail == "" {
+		if len(steps) == 1 && tail == "" && (steps[0].u.Scheme == "http" || steps[0].u.Scheme == "https") {
 			// Single upstream: stream through a reverse proxy (no buffering).
 			remote := steps[0].u
 			proxy := httputil.NewSingleHostReverseProxy(remote)
@@ -242,7 +269,7 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 			proxy.Transport = transport
 			// An unreachable upstream must not lose a cached copy.
 			proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, perr error) {
-				log.Printf("------ --- %s [proxy error: %v]\n", r.URL, perr)
+				logger.Warn("proxy error", "url", r.URL, perr)
 				if rt.serveStale(w, r) {
 					return
 				}
@@ -254,12 +281,22 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 
 		if len(steps) == 0 {
 			// Chain of only "direct"/"off": answer locally.
-			log.Printf("proxy chain %q has no upstream, all direct.", opts.Proxy)
+			logger.Warn("proxy chain has no upstream, all direct", "proxy", opts.Proxy)
 			return rt
 		}
 		rt.chain = steps
 		rt.tail = tail
 		rt.chainClient = &http.Client{Transport: transport}
+		for i := range rt.chain {
+			st := &rt.chain[i]
+			if st.u.Scheme == "file" {
+				// Local directory mirror: a per-step transport rooted at the
+				// step's directory; http.Dir keeps served paths inside it.
+				tr := transport.Clone()
+				tr.RegisterProtocol("file", http.NewFileTransport(http.Dir(st.u.Path)))
+				st.client = &http.Client{Transport: tr}
+			}
+		}
 	}
 	return rt
 }
@@ -278,7 +315,7 @@ func (rt *Router) count(mode string, mw *metricsResponseWriter) {
 	totalRequest.WithLabelValues(mode, mw.status()).Inc()
 }
 
-// ServveHTTP implements http handler.
+// ServeHTTP implements http handler.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -301,7 +338,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mw.Header().Add("Vary", HeaderDisableModuleFetch)
 
 	if rt.fetchDisabled(r) {
-		log.Printf("------ --- %s [cache-only]\n", r.URL)
+		logger.Info("cache-only", "url", r.URL)
 		mw.Header().Set(HeaderDisableModuleFetch, "true")
 		if _, served := rt.serveFromCache(mw, r, true); served {
 			rt.count("cached", mw)
@@ -313,7 +350,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if (rt.proxy == nil && rt.chain == nil) || rt.Direct(strings.TrimPrefix(r.URL.Path, "/")) {
-		log.Printf("------ --- %s [direct]\n", r.URL)
+		logger.Info("direct", "url", r.URL)
 		rt.srv.ServeHTTP(mw, r)
 		rt.count("direct", mw)
 		return
@@ -324,12 +361,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rt.proxy != nil {
-		log.Printf("------ --- %s [proxy]\n", r.URL)
+		logger.Info("proxy", "url", r.URL)
 		rt.proxy.ServeHTTP(mw, r)
 		rt.count("proxy", mw)
 		return
 	}
-	log.Printf("------ --- %s [proxy-chain]\n", r.URL)
+	logger.Info("proxy-chain", "url", r.URL)
 	rt.serveChain(mw, r)
 	rt.count("proxy", mw)
 }
@@ -377,53 +414,109 @@ func (rt *Router) serveChain(mw *metricsResponseWriter, r *http.Request) {
 // into the download cache (cached=true) — or into a temporary file, returned
 // as tmp, when the upstream marks the response as uncacheable. Non-200
 // answers return the status and a capped copy of the body. Transport failures
-// are retried twice with a small linear backoff.
+// and retryable upstream statuses (429/5xx) are retried twice with a small
+// linear backoff, honoring the upstream's Retry-After when it is short.
 func (rt *Router) fetchUpstream(st upstreamStep, r *http.Request) (status int, tmp string, cached bool, body []byte, err error) {
 	u := *st.u
-	u.Path = path.Join(u.Path, r.URL.Path)
+	if st.u.Scheme == "file" {
+		// The per-step transport serves file requests rooted at the step's
+		// directory (http.Dir), so the URL carries the request path as-is.
+		u.Host = "mirror"
+		u.Path = r.URL.Path
+	} else {
+		u.Path = path.Join(u.Path, r.URL.Path)
+	}
 	for attempt := 0; ; attempt++ {
-		status, tmp, cached, body, err = rt.fetchUpstreamOnce(st, r, u.String())
-		if err == nil || attempt >= 2 {
+		var retryAfter time.Duration
+		status, tmp, cached, body, retryAfter, err = rt.fetchUpstreamOnce(st, r, u.String())
+		if (err == nil && !retryableStatus(status)) || attempt >= 2 {
 			return
 		}
-		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+		delay := max(retryAfter, time.Duration(attempt+1)*100*time.Millisecond)
+		if delay > 2*time.Second {
+			// Do not stretch the retry window for a long Retry-After: fail
+			// now and let the chain/tail decide.
+			return
+		}
+		time.Sleep(delay)
 	}
 }
 
-func (rt *Router) fetchUpstreamOnce(st upstreamStep, r *http.Request, urlStr string) (int, string, bool, []byte, error) {
+// retryableStatus reports whether a chain step's HTTP failure is worth
+// retrying (rate limit or transient server/gateway failure). Like the go
+// command's GOPROXY handling, not-exist answers (404/410) never are.
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// retryAfterDelay returns the delay requested by the Retry-After header
+// (delta-seconds or HTTP date), 0 when absent or unparsable.
+func retryAfterDelay(h http.Header) time.Duration {
+	v := strings.TrimSpace(strings.Join(h.Values("Retry-After"), ","))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseUint(v, 10, 64); err == nil {
+		const maxSecs = uint64(math.MaxInt64 / int64(time.Second))
+		if secs > maxSecs {
+			return time.Duration(math.MaxInt64)
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+func (rt *Router) fetchUpstreamOnce(st upstreamStep, r *http.Request, urlStr string) (status int, tmp string, cached bool, body []byte, retryAfter time.Duration, rerr error) {
+	client := st.client
+	if client == nil {
+		client = rt.chainClient
+	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, urlStr, nil)
 	if err != nil {
-		return 0, "", false, nil, err
+		return 0, "", false, nil, 0, err
 	}
-	resp, err := rt.chainClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return 0, "", false, nil, err
+		return 0, "", false, nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return resp.StatusCode, "", false, body, nil
+		return resp.StatusCode, "", false, body, retryAfterDelay(resp.Header), nil
 	}
 	if cacheRestricted(resp.Header) {
-		f, err := os.CreateTemp("", "goproxy.upstream.*")
+		f, err := os.CreateTemp(rt.tempDir, "goproxy.upstream.*")
 		if err != nil {
-			return 0, "", false, nil, err
+			return 0, "", false, nil, 0, err
 		}
 		defer func() { _ = f.Close() }()
 		if _, err := io.Copy(f, resp.Body); err != nil {
 			_ = os.Remove(f.Name())
-			return 0, "", false, nil, err
+			return 0, "", false, nil, 0, err
 		}
-		return http.StatusOK, f.Name(), false, nil, nil
+		return http.StatusOK, f.Name(), false, nil, 0, nil
 	}
 	file := cacheFileFor(rt.downloadRoot, r.URL.Path)
 	if err := os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
-		return 0, "", false, nil, err
+		return 0, "", false, nil, 0, err
 	}
 	if err := renameio.WriteToFile(file, resp.Body, 0o666); err != nil {
-		return 0, "", false, nil, err
+		return 0, "", false, nil, 0, err
 	}
-	return http.StatusOK, "", true, nil, nil
+	return http.StatusOK, "", true, nil, 0, nil
 }
 
 // serveChainFailure answers an exhausted chain: a cached copy wins over the
@@ -498,11 +591,11 @@ func contentTypeFor(p string) string {
 	if strings.HasSuffix(p, "/@latest") {
 		return "text/plain; charset=UTF-8"
 	}
-	i := strings.Index(p, "/@v/")
-	if i < 0 {
+	_, after, ok := strings.Cut(p, "/@v/")
+	if !ok {
 		return ""
 	}
-	what := p[i+len("/@v/"):]
+	what := after
 	if what == "list" {
 		return "text/plain; charset=UTF-8"
 	}

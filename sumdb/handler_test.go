@@ -33,6 +33,7 @@ func TestHandler(t *testing.T) {
 	t.Run("fetchDisabled", testFetchDisabled)
 	t.Run("validate", testValidate)
 	t.Run("emptyUpstream", testEmptyUpstream)
+	t.Run("customDB", testCustomDB)
 }
 
 func testSupported(t *testing.T) {
@@ -387,9 +388,11 @@ func TestParsePath(t *testing.T) {
 			wantErr:     false,
 		},
 		{
-			name:    "invalid path - too few parts",
-			rawPath: "/sumdb/sum.golang.org",
-			wantErr: true,
+			name:        "db root without sub-path",
+			rawPath:     "/sumdb/sum.golang.org",
+			wantWhichDB: "sum.golang.org",
+			wantPath:    "",
+			wantErr:     false,
 		},
 		{
 			name:    "invalid path - empty",
@@ -528,9 +531,11 @@ func TestHandlerInvalidPath(t *testing.T) {
 
 	tests := []TestCase{
 		{
+			// A supported db with no protocol sub-path: parsed, then
+			// rejected by path validation (not "unsupported db").
 			name:           "path too short",
 			path:           "/sumdb/sum.golang.org",
-			expectedStatus: http.StatusGone,
+			expectedStatus: http.StatusNotFound,
 		},
 		{
 			name:           "unsupported database",
@@ -553,4 +558,68 @@ func TestHandlerInvalidPath(t *testing.T) {
 			_ = resp.Body.Close()
 		})
 	}
+}
+
+// testCustomDB covers AddProxiedDB: multi-segment db names are matched at
+// segment boundaries with the longest registered name winning, and their
+// cache files land under sumdb/<name>/....
+func testCustomDB(t *testing.T) {
+	var longHits, shortHits int
+	var gotPath string
+	long := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		longHits++
+		gotPath = r.URL.Path
+		_, _ = fmt.Fprint(w, "tile-bytes")
+	}))
+	defer long.Close()
+	short := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		shortHits++
+		_, _ = fmt.Fprint(w, "short")
+	}))
+	defer short.Close()
+
+	AddProxiedDB("corp.example.com", short.URL)
+	AddProxiedDB("corp.example.com/sumdb", long.URL)
+	t.Cleanup(func() {
+		delete(supportedSumDB, "corp.example.com")
+		delete(supportedSumDB, "corp.example.com/sumdb")
+	})
+
+	root := t.TempDir()
+	h := NewHandler(root, false)
+	get := func(path string) *http.Response {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "https://goproxy.io"+path, nil)
+		h.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	if resp := get("/sumdb/corp.example.com/sumdb/supported"); resp.StatusCode != http.StatusOK {
+		t.Errorf("custom db supported status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp0(get("/sumdb/corp.example.com/sumdb/tile/1/0/000"))
+	if longHits != 1 {
+		t.Errorf("longest-name match: long db hits = %d, want 1", longHits)
+	}
+	if shortHits != 0 {
+		t.Errorf("longest-name match: short db hits = %d, want 0", shortHits)
+	}
+	if gotPath != "/tile/1/0/000" {
+		t.Errorf("upstream path = %q, want /tile/1/0/000", gotPath)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sumdb", "corp.example.com", "sumdb", "tile", "1", "0", "000")); err != nil {
+		t.Errorf("multi-segment db must cache under sumdb/<name>/...: %v", err)
+	}
+	if resp := get("/sumdb/corp.example.com/tile/1/0/000"); resp.StatusCode != http.StatusOK {
+		t.Errorf("short db tile status = %d, want 200", resp.StatusCode)
+	}
+	if shortHits != 1 {
+		t.Errorf("short db hits = %d, want 1", shortHits)
+	}
+}
+
+// resp0 drains and closes a response body, reporting the status.
+func resp0(resp *http.Response) int {
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode
 }
