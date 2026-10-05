@@ -21,9 +21,17 @@ func TestMapNotFound(t *testing.T) {
 	if !errors.Is(mapNotFound(notFound), fs.ErrNotExist) {
 		t.Error("go command not-found diagnostic must map to fs.ErrNotExist")
 	}
+	unrecognized := fmt.Errorf("go: list -m -json -versions X/y@latest:\ngo: X/y@latest: unrecognized import path \"X/y\": reading https://X/y?go-get=1: 404 Not Found\n")
+	if !errors.Is(mapNotFound(unrecognized), fs.ErrNotExist) {
+		t.Error("unrecognized import path must map to fs.ErrNotExist")
+	}
 	other := fmt.Errorf("go: mod download -json X@v1.0.0:\nexit status 1\n")
 	if errors.Is(mapNotFound(other), fs.ErrNotExist) {
 		t.Error("transient go command failure must not map to fs.ErrNotExist")
+	}
+	gitAuth := fmt.Errorf("go: list -m -json -versions github.com/a/b/c@latest:\ngo: github.com/a/b/c: git ls-remote -q origin: exit status 128:\nfatal: could not read Username for 'https://github.com': terminal prompts disabled\n")
+	if errors.Is(mapNotFound(gitAuth), fs.ErrNotExist) {
+		t.Error("git credential failure is a proxy-host problem, must stay 500")
 	}
 }
 

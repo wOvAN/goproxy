@@ -259,6 +259,7 @@ var goNotFoundPatterns = []string{
 	"unknown revision",
 	"cannot find module",
 	"malformed module path",
+	"unrecognized import path",
 }
 
 // mapNotFound tags go command errors that indicate a missing module with
@@ -267,6 +268,7 @@ func mapNotFound(err error) error {
 	msg := err.Error()
 	for _, p := range goNotFoundPatterns {
 		if strings.Contains(msg, p) {
+			logger.Warn("go command not-found, answering 404", "pattern", p, "error", msg)
 			return fmt.Errorf("%w: %s", fs.ErrNotExist, msg)
 		}
 	}
@@ -376,7 +378,10 @@ func fetchList(mpath string) ([]byte, error) {
 			return nil, err
 		}
 		if list.Path != mpath {
-			return nil, fmt.Errorf("go list -m: asked for %s but got %s", mpath, list.Path)
+			// The path is a package inside another module, not a module
+			// itself: answer 404 so the client walks up to the parent path.
+			logger.Warn("not a module path, answering 404", "asked", mpath, "resolved", list.Path)
+			return nil, fmt.Errorf("%w: go list -m: asked for %s but got %s", fs.ErrNotExist, mpath, list.Path)
 		}
 		data := []byte(strings.Join(list.Versions, "\n") + "\n")
 		if len(data) == 1 {
