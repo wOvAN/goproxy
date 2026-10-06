@@ -124,3 +124,20 @@ func TestRouterCachePathJoin(t *testing.T) {
 		t.Errorf("path traversal: served %q from outside cache root", rec.Body.String())
 	}
 }
+
+// TestCacheFileForCanonical pins the canonical, escaped version layout of
+// cache paths: mixed-case and unescaped variants of one version map to one
+// file, list/@latest pass through untouched.
+func TestCacheFileForCanonical(t *testing.T) {
+	for _, tc := range []struct{ url, want string }{
+		{"/github.com/Azure/sdk/@v/v1.2.3.info", "/go/github.com/Azure/sdk/@v/v1.2.3.info"},
+		{"/github.com/!p!roton!mail/go-crypto/@v/V1.2.3.mod", "/go/github.com/!p!roton!mail/go-crypto/@v/v1.2.3.mod"},
+		{"/github.com/a/b/@v/v2.6.3+incompatible.zip", "/go/github.com/a/b/@v/v2.6.3+incompatible.zip"},
+		{"/github.com/a/b/@v/list", "/go/github.com/a/b/@v/list"},
+		{"/github.com/a/b/@latest", "/go/github.com/a/b/@latest"},
+	} {
+		if got := cacheFileFor("/go", tc.url); got != tc.want {
+			t.Errorf("cacheFileFor(%q) = %q, want %q", tc.url, got, tc.want)
+		}
+	}
+}

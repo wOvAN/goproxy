@@ -6,6 +6,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"net/http"
@@ -78,22 +79,42 @@ func TestParseProxyChain(t *testing.T) {
 
 // stubOps answers from memory so router tests can exercise the direct tail
 // without a go command.
-type stubOps struct{ listBody string }
+type stubOps struct {
+	listBody string
+	// directErr, when set, is returned by every fetch method: a generic
+	// local failure (Server maps it to 500).
+	directErr error
+}
 
 func (s *stubOps) NewContext(r *http.Request) (context.Context, error) { return r.Context(), nil }
 func (s *stubOps) List(context.Context, string) (File, error) {
+	if s.directErr != nil {
+		return nil, s.directErr
+	}
 	return MemFile([]byte(s.listBody), time.Now()), nil
 }
 func (s *stubOps) Latest(context.Context, string) (File, error) {
+	if s.directErr != nil {
+		return nil, s.directErr
+	}
 	return nil, fs.ErrNotExist
 }
 func (s *stubOps) Info(context.Context, module.Version) (File, error) {
+	if s.directErr != nil {
+		return nil, s.directErr
+	}
 	return nil, fs.ErrNotExist
 }
 func (s *stubOps) GoMod(context.Context, module.Version) (File, error) {
+	if s.directErr != nil {
+		return nil, s.directErr
+	}
 	return nil, fs.ErrNotExist
 }
 func (s *stubOps) Zip(context.Context, module.Version) (File, error) {
+	if s.directErr != nil {
+		return nil, s.directErr
+	}
 	return nil, fs.ErrNotExist
 }
 
@@ -194,6 +215,18 @@ func TestRouterChain(t *testing.T) {
 	status, _, _ = get(rt, "github.com/x/none/@v/list", nil)
 	if status != http.StatusNotFound {
 		t.Errorf("tail off miss: status = %d, want 404", status)
+	}
+
+	// Upstream not-exist + local fetch failure: the upstream 404 is
+	// authoritative, the local 500 must not override it.
+	rt = NewRouter(NewServer(&stubOps{directErr: errors.New("git ls-remote: exit status 128")}, nil), &RouterOptions{
+		Proxy:        u1.URL + ",direct",
+		DownloadRoot: t.TempDir(),
+		CacheExpire:  time.Minute,
+	})
+	status, _, _ = get(rt, "github.com/x/shielded/@v/list", nil)
+	if status != http.StatusNotFound {
+		t.Errorf("upstream 404 + local failure: status = %d, want 404", status)
 	}
 
 	// Stale-on-error: chain exhausted, cached (expired) copy wins.

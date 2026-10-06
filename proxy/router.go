@@ -3,6 +3,8 @@ package proxy
 import (
 	"compress/gzip"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -19,6 +21,8 @@ import (
 
 	"github.com/goproxyio/goproxy/v2/logger"
 	"github.com/goproxyio/goproxy/v2/renameio"
+
+	"golang.org/x/mod/module"
 )
 
 // ListExpire list data expire data duration.
@@ -66,12 +70,12 @@ func (rt *Router) fetchDisabled(r *http.Request) bool {
 	return rt.disableFetch || v
 }
 
-// cacheRestricted reports whether an upstream response forbids being cached:
+// CacheRestricted reports whether an upstream response forbids being cached:
 // revalidation-required or private Cache-Control, an expired max-age, or a
 // Vary: * response. max-age is matched as a whole token so that max-age=60 is
 // not confused with max-age=0; quoted directive arguments are not parsed
 // (ponytail: upstreams do not quote them in practice).
-func cacheRestricted(h http.Header) bool {
+func CacheRestricted(h http.Header) bool {
 	cc := strings.ToLower(strings.Join(h.Values("Cache-Control"), ","))
 	for _, d := range []string{"no-store", "no-cache", "must-revalidate", "private", "proxy-revalidate", "s-maxage"} {
 		if strings.Contains(cc, d) {
@@ -96,6 +100,25 @@ func cacheRestricted(h http.Header) bool {
 // cacheFileFor returns the download-cache file for a request URL path,
 // built from a rooted-cleaned path so ".." segments cannot escape the root.
 func cacheFileFor(downloadRoot, urlPath string) string {
+	// Store version-named files under the canonical, escaped version (the
+	// layout the go command's download cache uses), so mixed-case and
+	// unescaped variants of one version map to one cache file.
+	if i := strings.LastIndex(urlPath, "/@v/"); i >= 0 {
+		what := urlPath[i+len("/@v/"):]
+		if j := strings.LastIndex(what, "."); j > 0 {
+			v := what[:j]
+			if dec, err := module.UnescapeVersion(v); err == nil {
+				v = dec
+			}
+			// CanonicalVersion only understands the lowercase "v" prefix.
+			if strings.HasPrefix(v, "V") {
+				v = "v" + v[1:]
+			}
+			if esc, err := module.EscapeVersion(module.CanonicalVersion(v)); err == nil {
+				urlPath = urlPath[:i+len("/@v/")] + esc + what[j:]
+			}
+		}
+	}
 	return filepath.Join(downloadRoot, filepath.FromSlash(path.Clean("/"+urlPath)))
 }
 
@@ -114,7 +137,7 @@ func (router *Router) customModResponse(r *http.Response) error {
 	if r.StatusCode == http.StatusOK {
 		// An upstream response that forbids caching is passed through
 		// untouched, never written to the download cache.
-		if cacheRestricted(r.Header) {
+		if CacheRestricted(r.Header) {
 			return nil
 		}
 		if err := cacheResponseBody(r, file); err != nil {
@@ -141,7 +164,9 @@ func (router *Router) customModResponse(r *http.Response) error {
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
-			// Do not cache the body of an error response as a module file.
+			// Do not cache the body of an error response as a module file;
+			// drain a bounded amount so the connection can be reused.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			return router.serveStaleOnError(r, file, p)
 		}
 		if err := cacheResponseBody(resp, file); err != nil {
@@ -218,15 +243,25 @@ func cacheResponseBody(resp *http.Response, file string) error {
 
 // countReader reads from r while counting the bytes read.
 type countReader struct {
-	r io.Reader
-	n int64
+	r   io.Reader
+	n   int64
+	err error // last non-EOF read error
 }
 
 // Read implements io.Reader.
 func (c *countReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
+	if err != nil && err != io.EOF {
+		c.err = err
+	}
 	return n, err
+}
+
+// Seek implements io.Seeker when the wrapped reader is one, so a countReader
+// can be passed to http.ServeContent.
+func (c *countReader) Seek(offset int64, whence int) (int64, error) {
+	return c.r.(io.Seeker).Seek(offset, whence)
 }
 
 // NewRouter returns a new Router using the given operations.
@@ -278,6 +313,7 @@ func NewRouter(srv *Server, opts *RouterOptions) *Router {
 				if rt.serveStale(w, r) {
 					return
 				}
+				w.Header().Set("Cache-Control", "no-store")
 				http.Error(w, perr.Error(), http.StatusBadGateway)
 			}
 			rt.proxy = proxy
@@ -408,11 +444,61 @@ func (rt *Router) serveChain(mw *metricsResponseWriter, r *http.Request) {
 		}
 	}
 	if rt.tail == "direct" {
+		if lastStatus == http.StatusNotFound || lastStatus == http.StatusGone {
+			// An upstream authoritatively answered not-exist: a local go
+			// command failure (missing VCS credentials, network) must not
+			// upgrade it to a 500 that aborts the client's path walk-up.
+			rt.srv.ServeHTTP(&notExistShield{ResponseWriter: mw, status: lastStatus, body: lastBody}, r)
+			return
+		}
 		rt.srv.ServeHTTP(mw, r)
 		return
 	}
 	rt.serveChainFailure(mw, r, lastStatus, lastBody, nil)
 }
+
+// notExistShield downgrades a local (go command) 5xx answer to the not-exist
+// status an earlier chain step already gave for the same path.
+type notExistShield struct {
+	http.ResponseWriter
+	status int
+	body   []byte
+	shadow bool
+}
+
+func (w *notExistShield) WriteHeader(code int) {
+	if code >= 500 && !w.shadow {
+		w.shadow = true
+		http.Error(w.ResponseWriter, string(w.body), w.status)
+		return
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *notExistShield) Write(p []byte) (int, error) {
+	if w.shadow {
+		return len(p), nil
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *notExistShield) ReadFrom(r io.Reader) (int64, error) {
+	if w.shadow {
+		return 0, nil
+	}
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(w.ResponseWriter, r)
+}
+
+func (w *notExistShield) Flush() {
+	if !w.shadow {
+		w.ResponseWriter.(http.Flusher).Flush()
+	}
+}
+
+func (w *notExistShield) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // fetchUpstream fetches r's path from one chain step. A 200 body is streamed
 // into the download cache (cached=true) — or into a temporary file, returned
@@ -433,7 +519,7 @@ func (rt *Router) fetchUpstream(st upstreamStep, r *http.Request) (status int, t
 	for attempt := 0; ; attempt++ {
 		var retryAfter time.Duration
 		status, tmp, cached, body, retryAfter, err = rt.fetchUpstreamOnce(st, r, u.String())
-		if (err == nil && !retryableStatus(status)) || attempt >= 2 {
+		if (err == nil && !retryableStatus(status)) || attempt >= 2 || permanentTransportError(err) {
 			return
 		}
 		delay := max(retryAfter, time.Duration(attempt+1)*100*time.Millisecond)
@@ -459,6 +545,26 @@ func retryableStatus(status int) bool {
 		return true
 	}
 	return false
+}
+
+// permanentTransportError reports a transport failure that will not heal on
+// retry: the host does not resolve, its certificate is rejected, or the URL
+// scheme is unsupported.
+func permanentTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return true
+	}
+	var uaErr x509.UnknownAuthorityError
+	var hvErr x509.HostnameError
+	var ciErr x509.CertificateInvalidError
+	if errors.As(err, &uaErr) || errors.As(err, &hvErr) || errors.As(err, &ciErr) {
+		return true
+	}
+	return strings.Contains(err.Error(), "unsupported protocol scheme")
 }
 
 // retryAfterDelay returns the delay requested by the Retry-After header
@@ -501,7 +607,7 @@ func (rt *Router) fetchUpstreamOnce(st upstreamStep, r *http.Request, urlStr str
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return resp.StatusCode, "", false, body, retryAfterDelay(resp.Header), nil
 	}
-	if cacheRestricted(resp.Header) {
+	if CacheRestricted(resp.Header) {
 		f, err := os.CreateTemp(rt.tempDir, "goproxy.upstream.*")
 		if err != nil {
 			return 0, "", false, nil, 0, err
@@ -535,6 +641,7 @@ func (rt *Router) serveChainFailure(mw *metricsResponseWriter, r *http.Request, 
 		if err != nil {
 			msg = err.Error()
 		}
+		mw.Header().Set("Cache-Control", "no-store")
 		http.Error(mw, msg, http.StatusBadGateway)
 		return
 	}
@@ -564,7 +671,14 @@ func (rt *Router) serveStale(w http.ResponseWriter, r *http.Request) bool {
 	if cc := cacheControlFor(r.URL.Path); cc != "" {
 		w.Header().Set("Cache-Control", cc)
 	}
-	http.ServeContent(w, r, "", info.ModTime(), f)
+	cr := &countReader{r: f}
+	http.ServeContent(w, r, "", info.ModTime(), cr)
+	if cr.err != nil {
+		logger.Error("serving cached file failed", "path", r.URL.Path, cr.err)
+		if conn, _, herr := http.NewResponseController(w).Hijack(); herr == nil {
+			_ = conn.Close()
+		}
+	}
 	return true
 }
 
@@ -574,19 +688,28 @@ func (rt *Router) serveTempFile(mw *metricsResponseWriter, r *http.Request, file
 	defer func() { _ = os.Remove(file) }()
 	f, err := os.Open(file)
 	if err != nil {
+		mw.Header().Set("Cache-Control", "no-store")
 		http.Error(mw, "upstream response not cacheable", http.StatusBadGateway)
 		return
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
+		mw.Header().Set("Cache-Control", "no-store")
 		http.Error(mw, "upstream response not cacheable", http.StatusBadGateway)
 		return
 	}
 	if ctype := contentTypeFor(r.URL.Path); ctype != "" {
 		mw.Header().Set("Content-Type", ctype)
 	}
-	http.ServeContent(mw, r, "", info.ModTime(), f)
+	cr := &countReader{r: f}
+	http.ServeContent(mw, r, "", info.ModTime(), cr)
+	if cr.err != nil {
+		logger.Error("serving upstream copy failed", "path", r.URL.Path, cr.err)
+		if conn, _, herr := http.NewResponseController(mw).Hijack(); herr == nil {
+			_ = conn.Close()
+		}
+	}
 }
 
 // contentTypeFor returns the content type for a module file served from
@@ -651,7 +774,14 @@ func (rt *Router) serveFromCache(mw *metricsResponseWriter, r *http.Request, byp
 	if cc := cacheControlFor(r.URL.Path); cc != "" {
 		mw.Header().Set("Cache-Control", cc)
 	}
-	http.ServeContent(mw, r, "", info.ModTime(), f)
+	cr := &countReader{r: f}
+	http.ServeContent(mw, r, "", info.ModTime(), cr)
+	if cr.err != nil {
+		logger.Error("serving cached file failed", "path", r.URL.Path, cr.err)
+		if conn, _, herr := http.NewResponseController(mw).Hijack(); herr == nil {
+			_ = conn.Close()
+		}
+	}
 	return true, true
 }
 

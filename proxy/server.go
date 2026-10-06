@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goproxyio/goproxy/v2/logger"
+
 	"golang.org/x/mod/module"
 )
 
@@ -153,6 +155,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx, err := s.ops.NewContext(r)
 	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -243,16 +246,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(openErr, fs.ErrNotExist) {
 			code = http.StatusNotFound
 		}
+		if code >= 500 {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		http.Error(w, openErr.Error(), code)
 		return
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if info.IsDir() {
+		w.Header().Set("Cache-Control", "no-store")
 		http.Error(w, "unexpected directory", http.StatusNotFound)
 		return
 	}
@@ -263,7 +271,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if FetchDisabled(ctx) {
 		w.Header().Set(HeaderDisableModuleFetch, "true")
 	}
-	http.ServeContent(w, r, what, info.ModTime(), f)
+	cr := &countReader{r: f}
+	http.ServeContent(w, r, what, info.ModTime(), cr)
+	if cr.err != nil {
+		logger.Error("serving file failed", "path", r.URL.Path, cr.err)
+		if conn, _, herr := http.NewResponseController(w).Hijack(); herr == nil {
+			_ = conn.Close()
+		}
+	}
 }
 
 // MemFile returns an File containing the given in-memory content and modification time.

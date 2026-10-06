@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/goproxyio/goproxy/v2/logger"
+	"github.com/goproxyio/goproxy/v2/proxy"
 	"github.com/goproxyio/goproxy/v2/renameio"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/tlog"
@@ -130,7 +131,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		firstData   []byte
 	)
 	for _, host := range supportedSumDB[whichDB] {
-		status, data, err := h.fetch(r.Context(), host, p)
+		status, data, restricted, err := h.fetch(r.Context(), host, p)
 		if err != nil {
 			logger.Error("sumdb: proxy request failed", "host", host, "path", p, err)
 			continue
@@ -138,7 +139,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// An empty 200 body is a broken mirror, not a valid record:
 		// fall through to the next host.
 		if status == http.StatusOK && len(data) > 0 {
-			if cacheable && h.downloadRoot != "" {
+			// A cache-restricted response is passed through, never written
+			// to the download cache.
+			if cacheable && !restricted && h.downloadRoot != "" {
 				h.writeCache(whichDB, p, data)
 			}
 			respondSumdb(w, http.StatusOK, p, data)
@@ -150,12 +153,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if firstSeen {
 		if firstStatus == http.StatusOK {
+			w.Header().Set("Cache-Control", "no-store")
 			http.Error(w, "empty sumdb response", http.StatusBadGateway)
 			return
 		}
 		respondSumdb(w, firstStatus, p, firstData)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	http.Error(w, "all sumdb upstreams failed", http.StatusGone)
 }
 
@@ -213,29 +218,29 @@ func validatePath(p string) error {
 
 // fetch fetches p from one sumdb host. The body is read here, under the
 // per-host context, so it is complete before the context is cancelled.
-func (h *Handler) fetch(ctx context.Context, host, p string) (int, []byte, error) {
+func (h *Handler) fetch(ctx context.Context, host, p string) (status int, data []byte, restricted bool, err error) {
 	urlPath, err := url.Parse(host)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, false, err
 	}
 	urlPath.Path = strings.TrimSuffix(urlPath.Path, "/") + "/" + p
 	ctx, cancel := context.WithTimeout(ctx, sumdbHostTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlPath.String(), nil)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, false, err
 	}
 	logger.Info("sumdb: proxy request", "url", urlPath.String())
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, false, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return 0, nil, err
+	data, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if rerr != nil {
+		return 0, nil, false, rerr
 	}
-	return resp.StatusCode, data, nil
+	return resp.StatusCode, data, proxy.CacheRestricted(resp.Header), nil
 }
 
 // cachePath returns the download-cache file for a sumdb path.

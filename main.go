@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"slices"
 
@@ -457,7 +458,24 @@ func (*ops) Info(ctx context.Context, m module.Version) (proxy.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.Open(d.Info)
+	f, err := os.Open(d.Info)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	var info struct {
+		Version string
+	}
+	if err := json.NewDecoder(f).Decode(&info); err != nil {
+		return nil, fmt.Errorf("parsing %s: %v", d.Info, err)
+	}
+	if info.Version != m.Version {
+		return nil, fmt.Errorf("%w: %s: info version %q does not match requested version", fs.ErrNotExist, m, info.Version)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 // GoMod fetches go mod file.

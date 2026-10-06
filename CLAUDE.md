@@ -16,7 +16,7 @@ make image      # docker build -t goproxy/goproxy .
 make clean      # git clean -f -d -X — DESTRUCTIVE, removes untracked files incl. bin/
 ```
 
-Run a single test: `go test ./sumdb/ -run TestName` (unit tests in `main_test.go`, `renameio/`, `sumdb/`).
+Run a single test: `go test ./sumdb/ -run TestName` (unit tests in root `main_test.go`/`gc_test.go`, `proxy/`, `renameio/`, `sumdb/`). Full CLI reference: `docs/CLI.md`. Condensed agent guide: `AGENTS.md`.
 
 End-to-end test (mirrors CI): start the proxy, then run the get script:
 
@@ -56,7 +56,7 @@ Environment invariants set in `main.go` `setup()` (flags parsed there, not `init
 
 ## CI
 
-CircleCI (`.circleci/config.yml`), two jobs — `proxy-mode` and `router-mode`. Each: `make tidy` → `make test` → `make build` → start `bin/goproxy` in the background → `bash test/get_test.sh`. New code must pass both unit tests and the live `go get` e2e.
+CircleCI (`.circleci/config.yml`), two jobs — `proxy-mode` and `router-mode`. Each: `make tidy` → `make test` → `make build` → start `bin/goproxy` in the background → `bash test/get_test.sh`. New code must pass both unit tests and the live `go get` e2e. GitHub Actions (`.github/workflows/docker.yml`) builds/pushes a multi-arch GHCR image on `v*` tag push.
 
 ## Docker
 
