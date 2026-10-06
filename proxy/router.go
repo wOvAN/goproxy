@@ -753,17 +753,23 @@ func (rt *Router) serveFromCache(mw *metricsResponseWriter, r *http.Request, byp
 	}
 	defer func() { _ = f.Close() }()
 	found = true
+	what := ""
+	if i := strings.Index(r.URL.Path, "/@v/"); i >= 0 {
+		what = r.URL.Path[i+len("/@v/"):]
+	}
 	if !bypassTTL {
-		what := ""
-		if i := strings.Index(r.URL.Path, "/@v/"); i >= 0 {
-			what = r.URL.Path[i+len("/@v/"):]
-		}
 		if strings.HasSuffix(r.URL.Path, "/@latest") && time.Since(info.ModTime()) >= ListExpire {
 			return true, false
 		}
 		if what == "list" && time.Since(info.ModTime()) >= rt.cacheExpire {
 			return true, false
 		}
+	}
+	if what == "list" && info.Size() == 0 {
+		// Negative cache marker (the path was resolved as not-a-module within
+		// the cache TTL): answer 404 from cache, without upstream or go command.
+		http.Error(mw, "not found", http.StatusNotFound)
+		return true, true
 	}
 	ctype := contentTypeFor(r.URL.Path)
 	if ctype == "" {

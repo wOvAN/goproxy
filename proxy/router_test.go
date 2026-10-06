@@ -141,3 +141,33 @@ func TestCacheFileForCanonical(t *testing.T) {
 		}
 	}
 }
+
+func TestRouterListNegativeCache(t *testing.T) {
+	var hits int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.NotFound(w, r)
+	}))
+	defer up.Close()
+	root := t.TempDir()
+	file := filepath.Join(root, "example.com", "a", "b", "@v", "list")
+	if err := os.MkdirAll(filepath.Dir(file), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+		Proxy:        up.URL + ",direct",
+		DownloadRoot: root,
+		CacheExpire:  time.Minute,
+	})
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/example.com/a/b/@v/list", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+	if hits != 0 {
+		t.Errorf("negative cache marker must not hit upstream, %d hits", hits)
+	}
+}

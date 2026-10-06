@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goproxyio/goproxy/v2/proxy"
 	"golang.org/x/mod/module"
@@ -103,4 +105,22 @@ func TestFetchDisabled(t *testing.T) {
 		t.Error("cache-only miss must carry Disable-Module-Fetch header")
 	}
 	_ = resp.Body.Close()
+}
+
+func TestListNegativeCache(t *testing.T) {
+	downloadRoot = t.TempDir()
+	oldExpire := cacheExpire
+	cacheExpire = time.Hour
+	defer func() { cacheExpire = oldExpire }()
+	const mpath = "example.com/a/b"
+	file := listPath(mpath)
+	if err := os.MkdirAll(filepath.Dir(file), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := new(ops).List(context.Background(), mpath); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("fresh empty list file must serve as cached not-found, got %v", err)
+	}
 }

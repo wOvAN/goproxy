@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -350,6 +351,10 @@ func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
 		return openCached(file)
 	}
 	if info, err := os.Stat(file); err == nil && time.Since(info.ModTime()) < cacheExpire {
+		if info.Size() == 0 {
+			// Fresh negative cache marker (see markListNotFound): not a module.
+			return nil, fmt.Errorf("%w: %s: cached not-found", fs.ErrNotExist, mpath)
+		}
 		return os.Open(file)
 	}
 	data, err := fetchList(mpath)
@@ -382,12 +387,16 @@ func fetchList(mpath string) ([]byte, error) {
 			Versions []string
 		}
 		if err := goJSON(&list, goBin, "list", "-m", "-json", "-versions", mpath+"@latest"); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				markListNotFound(mpath)
+			}
 			return nil, err
 		}
 		if list.Path != mpath {
 			// The path is a package inside another module, not a module
 			// itself: answer 404 so the client walks up to the parent path.
 			logger.Debug("not a module path, answering 404", "asked", mpath, "resolved", list.Path)
+			markListNotFound(mpath)
 			return nil, fmt.Errorf("%w: go list -m: asked for %s but got %s", fs.ErrNotExist, mpath, list.Path)
 		}
 		data := []byte(strings.Join(list.Versions, "\n") + "\n")
@@ -408,6 +417,21 @@ func fetchList(mpath string) ([]byte, error) {
 		return nil, err
 	}
 	return v.([]byte), nil
+}
+
+// markListNotFound writes an empty list file as a negative cache marker, so
+// repeated probes of a non-module path (the go command probes every package
+// prefix) are answered 404 from cache until the list expires, instead of
+// re-running the go command on every probe.
+func markListNotFound(mpath string) {
+	file := listPath(mpath)
+	if err := os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
+		logger.Error("make cache dir failed", err)
+		return
+	}
+	if err := renameio.WriteFile(file, nil, 0666); err != nil {
+		logger.Error("write list marker failed", err)
+	}
 }
 
 // Latest fetches latest file. In cache-only mode it resolves the latest
