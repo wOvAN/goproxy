@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"slices"
 
 	"net/http"
@@ -94,7 +95,12 @@ func setup() {
 	flag.StringVar(&tempDir, "tempDir", "", "directory for upstream stream-through temp files; default is $TMPDIR")
 	flag.StringVar(&sumdbCustom, "sumdb", "", `extra proxied checksum databases: "name url,name2 url2" (url optional, defaults to https://name)`)
 	flag.BoolVar(&insecure, "insecure", false, "allow insecure TLS connections to upstream proxies and sumdb mirrors")
+	var logLevel slog.Level
+	flag.Func("logLevel", "log level: debug, info, warn, error (default info)", func(s string) error {
+		return logLevel.UnmarshalText([]byte(s))
+	})
 	flag.Parse()
+	logger.SetLevel(logLevel)
 
 	if maxConcurrentFetches > 0 {
 		goCmdSem = make(chan struct{}, maxConcurrentFetches)
@@ -269,7 +275,7 @@ func mapNotFound(err error) error {
 	msg := err.Error()
 	for _, p := range goNotFoundPatterns {
 		if strings.Contains(msg, p) {
-			logger.Warn("go command not-found, answering 404", "pattern", p, "error", msg)
+			logger.Debug("go command not-found, answering 404", "pattern", p, "error", msg)
 			return fmt.Errorf("%w: %s", fs.ErrNotExist, msg)
 		}
 	}
@@ -381,7 +387,7 @@ func fetchList(mpath string) ([]byte, error) {
 		if list.Path != mpath {
 			// The path is a package inside another module, not a module
 			// itself: answer 404 so the client walks up to the parent path.
-			logger.Warn("not a module path, answering 404", "asked", mpath, "resolved", list.Path)
+			logger.Debug("not a module path, answering 404", "asked", mpath, "resolved", list.Path)
 			return nil, fmt.Errorf("%w: go list -m: asked for %s but got %s", fs.ErrNotExist, mpath, list.Path)
 		}
 		data := []byte(strings.Join(list.Versions, "\n") + "\n")

@@ -35,6 +35,7 @@ runtime defaults.
 | `-fetchTimeout` | duration | `10m` | Max time a single request may take (`0` = no limit) |
 | `-tempDir` | string | *(empty)* = `$TMPDIR` | Dir for upstream stream-through temp files |
 | `-insecure` | bool | `false` | Skip upstream TLS certificate verification |
+| `-logLevel` | string | `info` | Log level: `debug`, `info`, `warn`, `error` (debug adds per-request routing/not-found lines) |
 | `-version` | bool | `false` | Print the build version and exit |
 
 ---

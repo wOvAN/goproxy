@@ -264,6 +264,20 @@ func (c *countReader) Seek(offset int64, whence int) (int64, error) {
 	return c.r.(io.Seeker).Seek(offset, whence)
 }
 
+// serveFile streams f to the client with http.ServeContent; a mid-stream read
+// error is logged and the connection is closed, so the client sees a truncated
+// response instead of a silently short one.
+func serveFile(w http.ResponseWriter, r *http.Request, name string, f io.ReadSeeker, modTime time.Time) {
+	cr := &countReader{r: f}
+	http.ServeContent(w, r, name, modTime, cr)
+	if cr.err != nil {
+		logger.Error("serving file failed", "path", r.URL.Path, cr.err)
+		if conn, _, herr := http.NewResponseController(w).Hijack(); herr == nil {
+			_ = conn.Close()
+		}
+	}
+}
+
 // NewRouter returns a new Router using the given operations.
 func NewRouter(srv *Server, opts *RouterOptions) *Router {
 	rt := &Router{
@@ -378,7 +392,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mw.Header().Add("Vary", HeaderDisableModuleFetch)
 
 	if rt.fetchDisabled(r) {
-		logger.Info("cache-only", "url", r.URL)
+		logger.Debug("cache-only", "url", r.URL)
 		mw.Header().Set(HeaderDisableModuleFetch, "true")
 		if _, served := rt.serveFromCache(mw, r, true); served {
 			rt.count("cached", mw)
@@ -390,7 +404,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if (rt.proxy == nil && rt.chain == nil) || rt.Direct(strings.TrimPrefix(r.URL.Path, "/")) {
-		logger.Info("direct", "url", r.URL)
+		logger.Debug("direct", "url", r.URL)
 		rt.srv.ServeHTTP(mw, r)
 		rt.count("direct", mw)
 		return
@@ -401,12 +415,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rt.proxy != nil {
-		logger.Info("proxy", "url", r.URL)
+		logger.Debug("proxy", "url", r.URL)
 		rt.proxy.ServeHTTP(mw, r)
 		rt.count("proxy", mw)
 		return
 	}
-	logger.Info("proxy-chain", "url", r.URL)
+	logger.Debug("proxy-chain", "url", r.URL)
 	rt.serveChain(mw, r)
 	rt.count("proxy", mw)
 }
@@ -671,14 +685,7 @@ func (rt *Router) serveStale(w http.ResponseWriter, r *http.Request) bool {
 	if cc := cacheControlFor(r.URL.Path); cc != "" {
 		w.Header().Set("Cache-Control", cc)
 	}
-	cr := &countReader{r: f}
-	http.ServeContent(w, r, "", info.ModTime(), cr)
-	if cr.err != nil {
-		logger.Error("serving cached file failed", "path", r.URL.Path, cr.err)
-		if conn, _, herr := http.NewResponseController(w).Hijack(); herr == nil {
-			_ = conn.Close()
-		}
-	}
+	serveFile(w, r, "", f, info.ModTime())
 	return true
 }
 
@@ -702,14 +709,7 @@ func (rt *Router) serveTempFile(mw *metricsResponseWriter, r *http.Request, file
 	if ctype := contentTypeFor(r.URL.Path); ctype != "" {
 		mw.Header().Set("Content-Type", ctype)
 	}
-	cr := &countReader{r: f}
-	http.ServeContent(mw, r, "", info.ModTime(), cr)
-	if cr.err != nil {
-		logger.Error("serving upstream copy failed", "path", r.URL.Path, cr.err)
-		if conn, _, herr := http.NewResponseController(mw).Hijack(); herr == nil {
-			_ = conn.Close()
-		}
-	}
+	serveFile(mw, r, "", f, info.ModTime())
 }
 
 // contentTypeFor returns the content type for a module file served from
@@ -774,14 +774,7 @@ func (rt *Router) serveFromCache(mw *metricsResponseWriter, r *http.Request, byp
 	if cc := cacheControlFor(r.URL.Path); cc != "" {
 		mw.Header().Set("Cache-Control", cc)
 	}
-	cr := &countReader{r: f}
-	http.ServeContent(mw, r, "", info.ModTime(), cr)
-	if cr.err != nil {
-		logger.Error("serving cached file failed", "path", r.URL.Path, cr.err)
-		if conn, _, herr := http.NewResponseController(mw).Hijack(); herr == nil {
-			_ = conn.Close()
-		}
-	}
+	serveFile(mw, r, "", f, info.ModTime())
 	return true, true
 }
 

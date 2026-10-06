@@ -18,8 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/goproxyio/goproxy/v2/logger"
-
 	"golang.org/x/mod/module"
 )
 
@@ -271,14 +269,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if FetchDisabled(ctx) {
 		w.Header().Set(HeaderDisableModuleFetch, "true")
 	}
-	cr := &countReader{r: f}
-	http.ServeContent(w, r, what, info.ModTime(), cr)
-	if cr.err != nil {
-		logger.Error("serving file failed", "path", r.URL.Path, cr.err)
-		if conn, _, herr := http.NewResponseController(w).Hijack(); herr == nil {
-			_ = conn.Close()
-		}
-	}
+	serveFile(w, r, what, f, info.ModTime())
 }
 
 // MemFile returns an File containing the given in-memory content and modification time.

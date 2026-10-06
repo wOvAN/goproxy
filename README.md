@@ -99,6 +99,7 @@ Other flags:
 - `-fetchTimeout` (default 10m, 0 = unlimited) — maximum time a single request may take.
 - `-tempDir` — directory for stream-through upstream temp files (default `$TMPDIR`).
 - `-insecure` (default `false`) — skip upstream TLS certificate verification (router transports and the sumdb client). Prefer keeping it off; it was the previous hardcoded behavior.
+- `-logLevel` (default `info`) — log level: `debug`, `info`, `warn`, `error`. At `info` the log carries the access log, startup, GC, and real problems; per-request routing lines and expected 404 not-found mappings are logged only at `debug`.
 
 ### SumDB Proxy
 

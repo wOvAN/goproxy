@@ -230,7 +230,7 @@ func (h *Handler) fetch(ctx context.Context, host, p string) (status int, data [
 	if err != nil {
 		return 0, nil, false, err
 	}
-	logger.Info("sumdb: proxy request", "url", urlPath.String())
+	logger.Debug("sumdb: proxy request", "url", urlPath.String())
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return 0, nil, false, err
