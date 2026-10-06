@@ -123,4 +123,7 @@ func TestListNegativeCache(t *testing.T) {
 	if _, err := new(ops).List(context.Background(), mpath); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("fresh empty list file must serve as cached not-found, got %v", err)
 	}
+	if _, err := new(ops).Latest(context.Background(), mpath); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("fresh empty list file must answer @latest from cache, got %v", err)
+	}
 }

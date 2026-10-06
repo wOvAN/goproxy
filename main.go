@@ -350,12 +350,17 @@ func (*ops) List(ctx context.Context, mpath string) (proxy.File, error) {
 	if proxy.FetchDisabled(ctx) {
 		return openCached(file)
 	}
-	if info, err := os.Stat(file); err == nil && time.Since(info.ModTime()) < cacheExpire {
-		if info.Size() == 0 {
+	if f, err := os.Open(file); err == nil {
+		info, serr := f.Stat()
+		if serr != nil || time.Since(info.ModTime()) >= cacheExpire {
+			_ = f.Close()
+		} else if info.Size() == 0 {
 			// Fresh negative cache marker (see markListNotFound): not a module.
+			_ = f.Close()
 			return nil, fmt.Errorf("%w: %s: cached not-found", fs.ErrNotExist, mpath)
+		} else {
+			return f, nil
 		}
-		return os.Open(file)
 	}
 	data, err := fetchList(mpath)
 	if err != nil {
@@ -439,6 +444,11 @@ func markListNotFound(mpath string) {
 func (*ops) Latest(ctx context.Context, path string) (proxy.File, error) {
 	if proxy.FetchDisabled(ctx) {
 		return latestFromCache(path)
+	}
+	if info, err := os.Stat(listPath(path)); err == nil && info.Size() == 0 && time.Since(info.ModTime()) < cacheExpire {
+		// Fresh negative cache marker (see markListNotFound): not a module,
+		// answer 404 without running the go command.
+		return nil, fmt.Errorf("%w: %s: cached not-found", fs.ErrNotExist, path)
 	}
 	d, err := download(module.Version{Path: path, Version: "latest"})
 	if err != nil {

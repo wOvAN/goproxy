@@ -71,6 +71,8 @@ Entries are tried in order. After a `,` the next entry is tried only when the cu
 
 When an upstream fetch fails, a previously cached copy of the module file is served when one exists (stale-on-error); upstream responses marked `no-store`/`no-cache`/`must-revalidate`/`private`/`proxy-revalidate`/`s-maxage`/`max-age=0`/`Vary: *` are passed through without being cached.
 
+Not-found answers (`404`/`410`) for module `list` and `@latest` paths are negatively cached for their cache expiry: repeated probes of a non-existent path (the go command probes every package prefix) are answered `404` from the cache, without an upstream request or a go command run.
+
 ### Custom checksum databases
 
 By default the built-in sum databases (`sum.golang.org`, `sum.golang.google.cn`, `gosum.io`) are proxied. To proxy additional (e.g. private) checksum databases, use the `-sumdb` flag:

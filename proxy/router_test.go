@@ -171,3 +171,41 @@ func TestRouterListNegativeCache(t *testing.T) {
 		t.Errorf("negative cache marker must not hit upstream, %d hits", hits)
 	}
 }
+
+// TestRouterChainNegativeMarks: a chain answering not-exist for @latest
+// writes a negative marker, so the next probe is answered 404 from cache
+// without touching the upstream.
+func TestRouterChainNegativeMarks(t *testing.T) {
+	var hits int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.NotFound(w, r)
+	}))
+	defer up.Close()
+	root := t.TempDir()
+	rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+		Proxy:        up.URL + ",direct",
+		DownloadRoot: root,
+		CacheExpire:  time.Minute,
+	})
+	get := func() int {
+		rec := httptest.NewRecorder()
+		rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/example.com/a/b/@latest", nil))
+		return rec.Code
+	}
+	if code := get(); code != http.StatusNotFound {
+		t.Fatalf("first status = %d, want 404", code)
+	}
+	if hits != 1 {
+		t.Errorf("first probe hits = %d, want 1", hits)
+	}
+	if code := get(); code != http.StatusNotFound {
+		t.Fatalf("second status = %d, want 404", code)
+	}
+	if hits != 1 {
+		t.Errorf("marked probe must not hit upstream, hits = %d", hits)
+	}
+	if fi, err := os.Stat(filepath.Join(root, "example.com", "a", "b", "@latest")); err != nil || fi.Size() != 0 {
+		t.Errorf("marker file = %v, %v, want empty", fi, err)
+	}
+}

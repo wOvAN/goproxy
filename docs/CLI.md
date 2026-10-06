@@ -83,6 +83,12 @@ TTL applied to cached `list` files and `@latest` lookups. Default `5m`.
 Immutable files (`.info`/`.mod`/`.zip`, sumdb `tile/`+`lookup/`) are not
 governed by this — they are served long-term and expire only via GC.
 
+Not-found answers for `list`/`@latest` paths are negatively cached for the
+same TTL (an empty marker file answered as `404` from cache), so probe
+storms of non-existent paths cost one upstream request and one go command
+run per path per TTL. `@latest` markers expire with the built-in 5-minute
+`@latest` TTL.
+
 ### `-disableModuleFetch`
 Global cache-only mode (per-request equivalent: the `Disable-Module-Fetch: true`
 request header). When active, every handler serves from the download cache

@@ -177,7 +177,11 @@ func (router *Router) customModResponse(r *http.Response) error {
 		}
 		return nil
 	}
-	// Upstream reported a miss/error: fall back to a stale cached copy.
+	// Upstream reported a miss/error: negatively cache an authoritative
+	// not-exist answer, then fall back to a stale cached copy.
+	if r.StatusCode == http.StatusNotFound || r.StatusCode == http.StatusGone {
+		router.markNotFound(p)
+	}
 	return router.serveStaleOnError(r, file, p)
 }
 
@@ -191,6 +195,12 @@ func (router *Router) serveStaleOnError(r *http.Response, file, p string) error 
 	}
 	info, err := f.Stat()
 	if err != nil || info.IsDir() {
+		_ = f.Close()
+		return nil
+	}
+	if info.Size() == 0 && (strings.HasSuffix(p, "/@latest") || strings.HasSuffix(p, "/@v/list")) {
+		// An empty list/@latest file is a negative cache marker, not stale
+		// content: pass the upstream failure through instead.
 		_ = f.Close()
 		return nil
 	}
@@ -462,6 +472,7 @@ func (rt *Router) serveChain(mw *metricsResponseWriter, r *http.Request) {
 			// An upstream authoritatively answered not-exist: a local go
 			// command failure (missing VCS credentials, network) must not
 			// upgrade it to a 500 that aborts the client's path walk-up.
+			rt.markNotFound(r.URL.Path)
 			rt.srv.ServeHTTP(&notExistShield{ResponseWriter: mw, status: lastStatus, body: lastBody}, r)
 			return
 		}
@@ -469,6 +480,28 @@ func (rt *Router) serveChain(mw *metricsResponseWriter, r *http.Request) {
 		return
 	}
 	rt.serveChainFailure(mw, r, lastStatus, lastBody, nil)
+}
+
+// markNotFound negatively caches a not-exist answer for a list or @latest
+// path: an empty marker file, fresh within its TTL, is answered 404 from
+// cache by serveFromCache, so probe storms of non-existent paths cost one
+// upstream (and go command) round trip per path per TTL. An existing cache
+// file is never overwritten: stale-on-error keeps serving it.
+func (rt *Router) markNotFound(p string) {
+	if !strings.HasSuffix(p, "/@latest") && !strings.HasSuffix(p, "/@v/list") {
+		return
+	}
+	file := cacheFileFor(rt.downloadRoot, p)
+	if _, err := os.Stat(file); err == nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(file), os.ModePerm); err != nil {
+		logger.Error("make cache dir failed", err)
+		return
+	}
+	if err := renameio.WriteFile(file, nil, 0666); err != nil {
+		logger.Error("write not-found marker failed", err)
+	}
 }
 
 // notExistShield downgrades a local (go command) 5xx answer to the not-exist
@@ -660,6 +693,9 @@ func (rt *Router) serveChainFailure(mw *metricsResponseWriter, r *http.Request, 
 		return
 	}
 	mw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if status == http.StatusNotFound || status == http.StatusGone {
+		rt.markNotFound(r.URL.Path)
+	}
 	mw.WriteHeader(status)
 	_, _ = mw.Write(body)
 }
@@ -677,6 +713,10 @@ func (rt *Router) serveStale(w http.ResponseWriter, r *http.Request) bool {
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil || info.IsDir() {
+		return false
+	}
+	if info.Size() == 0 && strings.HasSuffix(r.URL.Path, "/@latest") {
+		// An empty @latest file is a negative cache marker, not stale content.
 		return false
 	}
 	if ctype := contentTypeFor(r.URL.Path); ctype != "" {
@@ -743,15 +783,15 @@ func contentTypeFor(p string) string {
 // even past their cache expiry (cache-only mode: nothing to refetch from).
 func (rt *Router) serveFromCache(mw *metricsResponseWriter, r *http.Request, bypassTTL bool) (found, served bool) {
 	file := cacheFileFor(rt.downloadRoot, r.URL.Path)
-	info, err := os.Stat(file)
-	if err != nil {
-		return false, false
-	}
 	f, err := os.Open(file)
 	if err != nil {
 		return false, false
 	}
 	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return false, false
+	}
 	found = true
 	what := ""
 	if i := strings.Index(r.URL.Path, "/@v/"); i >= 0 {
@@ -765,9 +805,10 @@ func (rt *Router) serveFromCache(mw *metricsResponseWriter, r *http.Request, byp
 			return true, false
 		}
 	}
-	if what == "list" && info.Size() == 0 {
-		// Negative cache marker (the path was resolved as not-a-module within
-		// the cache TTL): answer 404 from cache, without upstream or go command.
+	if (what == "list" || strings.HasSuffix(r.URL.Path, "/@latest")) && info.Size() == 0 {
+		// Negative cache marker (the path was resolved as not-exist within
+		// the cache TTL): answer 404 from cache, without upstream or go
+		// command.
 		http.Error(mw, "not found", http.StatusNotFound)
 		return true, true
 	}
