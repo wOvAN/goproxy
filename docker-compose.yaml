@@ -1,10 +1,13 @@
-version: "2"
 services:
   goproxy:
-    image: goproxy/goproxy:latest
-    command: "-listen=0.0.0.0:8081 -cacheDir=/ext"
+    image: ghcr.io/wovan/goproxy:v2.8.0
+    # -metrics: Prometheus on a dedicated port (no /metrics on the module port).
+    # -gcInterval: cache cleanup relies on atime; fine on ext4 (relatime), do
+    # not enable on a noatime-mounted volume.
+    command: "-listen=0.0.0.0:8081 -cacheDir=/ext -metrics=:9090 -gcInterval=24h -gcKeep=720h"
     ports:
     - "8081:8081"
+    - "127.0.0.1:9090:9090"
     restart: always
     volumes:
       - ./cacheDir:/ext
