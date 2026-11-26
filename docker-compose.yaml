@@ -1,6 +1,6 @@
 services:
   goproxy:
-    image: ghcr.io/wovan/goproxy:v2.8.0
+    image: ghcr.io/wovan/goproxy:v2.8.1
     # -metrics: Prometheus on a dedicated port (no /metrics on the module port).
     # -gcInterval: cache cleanup relies on atime; fine on ext4 (relatime), do
     # not enable on a noatime-mounted volume.
