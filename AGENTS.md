@@ -13,6 +13,7 @@ make clean      # git clean -f -d -X  — DESTRUCTIVE, removes untracked files i
 ```
 
 - Single test: `go test ./sumdb/ -run TestName`. Unit tests live in the root (`main_test.go`, `gc_test.go`) and in `proxy/`, `sumdb/`, `renameio/`.
+- `make test`/`make build` run `go mod tidy` first (needs network). Full flag reference: `docs/CLI.md`.
 - End-to-end (mirrors CI): start the proxy in the background, then `bash test/get_test.sh`.
   - Proxy mode: `bin/goproxy &`
   - Router mode: `bin/goproxy -proxy https://goproxy.io -exclude "golang.org" &`
@@ -25,6 +26,8 @@ make clean      # git clean -f -d -X  — DESTRUCTIVE, removes untracked files i
 - Flags are parsed in `setup()` (called from `main`), **not** `init()` — keep it that way so test binaries are not polluted with flag parsing.
 - Use the vendored `renameio.WriteFile` (helpers in `renameio/` + `robustio/`) for cache-file writes, not raw `os.WriteFile` (atomic temp+rename, Windows retry, umask preservation).
 - 404 vs 500 is decided by `errors.Is(err, fs.ErrNotExist)`; go-command not-found diagnostics are tagged in `mapNotFound` (`main.go`).
+- All logging goes through the `logger` package (slog, level from `-logLevel`); per-request routing logs are `debug`-only. Do not add `fmt.Println`/`log.*` output.
+- Outbound HTTP respects `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` for free (go subprocess + transports cloned from `http.DefaultTransport`); no proxy flag exists.
 
 ## Layout
 
@@ -33,10 +36,11 @@ make clean      # git clean -f -d -X  — DESTRUCTIVE, removes untracked files i
 - `proxy/router.go` + `proxy/chain.go` — router mode (`-proxy` GOPROXY-style chain, `-exclude` globs).
 - `proxy/cachecontrol.go` — `Cache-Control` policy per path type.
 - `sumdb/handler.go` — proxies `/sumdb/<db>/...` to mirrors, caches tiles/lookups.
+- `logger/logger.go` — single slog text handler on stdout, configured in `setup()`.
 - `gc.go` (+ `gc_unix.go`/`gc_darwin.go`/`gc_windows.go`) — atime-based cache GC (build-tagged per platform).
 
 ## CI
 
 - CircleCI (`.circleci/config.yml`): `proxy-mode` and `router-mode` jobs — tidy → test → build → run proxy → `bash test/get_test.sh`. New code must pass unit tests **and** the live e2e.
+- **CircleCI is stale**: it pins `circleci/golang:1.13`, which cannot even parse `go.mod` (`go 1.27.0`). Verify with a local Go ≥ 1.27 instead of trusting a CircleCI run.
 - GitHub Actions (`.github/workflows/docker.yml`): builds/pushes a multi-arch GHCR image on tag push (`v*`).
-- Go 1.27.

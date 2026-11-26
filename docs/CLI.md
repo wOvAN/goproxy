@@ -35,6 +35,7 @@ runtime defaults.
 | `-fetchTimeout` | duration | `10m` | Max time a single request may take (`0` = no limit) |
 | `-tempDir` | string | *(empty)* = `$TMPDIR` | Dir for upstream stream-through temp files |
 | `-insecure` | bool | `false` | Skip upstream TLS certificate verification |
+| `-metrics` | string | *(empty)* = off | Prometheus `/metrics` listen address (dedicated port) |
 | `-logLevel` | string | `info` | Log level: `debug`, `info`, `warn`, `error` (debug adds per-request routing/not-found lines) |
 | `-version` | bool | `false` | Print the build version and exit |
 
@@ -47,8 +48,13 @@ Address the HTTP server binds to. Default `0.0.0.0:8081`.
 
 ### `-pathPrefix`
 Prefix stripped from every request path before routing, so the whole service
-(module protocol, `/metrics`, `/healthz`) can be mounted under a sub-path,
+(module protocol, `/healthz`) can be mounted under a sub-path,
 e.g. `-pathPrefix /goproxy` → requests to `/goproxy/github.com/x/y/@v/list`.
+
+### `-metrics`
+Prometheus `/metrics` is served on this **dedicated listener** (e.g.
+`-metrics :9090`), never on the public module port; an empty value (default)
+disables metrics serving. Point scrape config at this address.
 
 ### `-tlsCert`, `-tlsKey`
 When **both** are set the server serves HTTPS via `ListenAndServeTLS`;
@@ -59,7 +65,6 @@ Prints the version embedded at build time (`-ldflags "-X main.version=..."`)
 and exits. `make` embeds `git describe --tags --always --dirty`.
 
 ### Endpoints (not flags)
-- `GET /metrics` — Prometheus metrics (served by the access-log handler).
 - `GET /healthz` — `204 No Content` liveness probe, `Cache-Control: no-store`,
   served outside the counted module handlers.
 
@@ -106,6 +111,9 @@ Periodic atime-based garbage collection of the download cache.
 - Only the download cache is scanned (`…/cache/download`); the git/VCS cache
   under `…/cache/vcs` is untouched.
 - Safe against a running proxy: freshly fetched files have a recent atime.
+- Requires the filesystem to update atime: on a `noatime` mount every file
+  looks untouched and the GC deletes even hot cache files past `-gcKeep`
+  (`relatime`, the Linux default, is fine).
 - atime access is build-tagged per platform (`gc_unix.go` / `gc_darwin.go` /
   `gc_windows.go`); platforms without atime are a no-op.
 

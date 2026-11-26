@@ -91,7 +91,7 @@ Serve HTTPS by passing a certificate and key:
 ./bin/goproxy -listen=0.0.0.0:443 -tlsCert=/etc/ssl/goproxy.crt -tlsKey=/etc/ssl/goproxy.key
 ```
 
-`GET /healthz` answers `204 No Content` (liveness probes). With `-pathPrefix /prefix`, all routes (module protocol, `/metrics`, `/healthz`) are served under that prefix.
+`GET /healthz` answers `204 No Content` (liveness probes). With `-pathPrefix /prefix`, all routes (module protocol, `/healthz`) are served under that prefix.
 
 Other flags:
 
@@ -102,6 +102,7 @@ Other flags:
 - `-tempDir` — directory for stream-through upstream temp files (default `$TMPDIR`).
 - `-insecure` (default `false`) — skip upstream TLS certificate verification (router transports and the sumdb client). Prefer keeping it off; it was the previous hardcoded behavior.
 - `-logLevel` (default `info`) — log level: `debug`, `info`, `warn`, `error`. At `info` the log carries the access log, startup, GC, and real problems; per-request routing lines and expected 404 not-found mappings are logged only at `debug`.
+- `-metrics` (default empty) — Prometheus `/metrics` listen address (e.g. `:9090`). Metrics are served on this dedicated port, never on the public module port; an empty value disables them.
 
 ### SumDB Proxy
 
@@ -131,7 +132,7 @@ The download cache grows unbounded by default: cached module files and sumdb ent
 ./bin/goproxy -listen=0.0.0.0:80 -cacheDir=/var/lib/goproxy -gcInterval=1h -gcKeep=720h
 ```
 
-The sweep is safe against a running proxy: freshly fetched files have a recent access time, and non-empty directories are never removed.
+The sweep is safe against a running proxy: freshly fetched files have a recent access time, and non-empty directories are never removed. It relies on the filesystem updating **access times**: on a mount with `noatime` every file looks untouched, so the GC deletes even the hottest cache files once they age past `-gcKeep` (with `relatime`, the Linux default, files read at least daily stay alive).
 
 ### Private module authentication
 

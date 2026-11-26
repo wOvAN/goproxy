@@ -5,8 +5,8 @@ version: 2
 jobs:
   proxy-mode:
     docker:
-      - image: circleci/golang:1.13
-    working_directory: /go/src/github.com/goproxyio/goproxy/
+      - image: cimg/go:1.27
+    working_directory: ~/goproxy
     steps:
       - checkout
       - run:
@@ -27,8 +27,8 @@ jobs:
           command: bash test/get_test.sh
   router-mode:
     docker:
-      - image: circleci/golang:1.13
-    working_directory: /go/src/github.com/goproxyio/goproxy/
+      - image: cimg/go:1.27
+    working_directory: ~/goproxy
     steps:
       - checkout
       - run:
