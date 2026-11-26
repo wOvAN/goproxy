@@ -404,7 +404,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rt.fetchDisabled(r) {
 		logger.Debug("cache-only", "url", r.URL)
 		mw.Header().Set(HeaderDisableModuleFetch, "true")
-		if _, served := rt.serveFromCache(mw, r, true); served {
+		if served := rt.serveFromCache(mw, r, true); served {
 			rt.count("cached", mw)
 			return
 		}
@@ -420,7 +420,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, served := rt.serveFromCache(mw, r, false); served {
+	if served := rt.serveFromCache(mw, r, false); served {
 		rt.count("cached", mw)
 		return
 	}
@@ -448,7 +448,7 @@ func (rt *Router) serveChain(mw *metricsResponseWriter, r *http.Request) {
 		status, tmp, cached, body, err := rt.fetchUpstream(st, r)
 		switch {
 		case err == nil && cached:
-			if _, served := rt.serveFromCache(mw, r, false); served {
+			if served := rt.serveFromCache(mw, r, false); served {
 				return
 			}
 			lastStatus, lastBody = http.StatusBadGateway, nil
@@ -575,7 +575,11 @@ func (rt *Router) fetchUpstream(st upstreamStep, r *http.Request) (status int, t
 			// now and let the chain/tail decide.
 			return
 		}
-		time.Sleep(delay)
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return // client gone: stop fetching a dead upstream for it
+		}
 	}
 }
 
@@ -680,16 +684,15 @@ func (rt *Router) fetchUpstreamOnce(st upstreamStep, r *http.Request, urlStr str
 // upstream failure (stale-on-error), else the last upstream status is passed
 // through; a chain that only saw transport failures answers 502.
 func (rt *Router) serveChainFailure(mw *metricsResponseWriter, r *http.Request, status int, body []byte, err error) {
-	if _, served := rt.serveFromCache(mw, r, true); served {
+	if served := rt.serveFromCache(mw, r, true); served {
 		return
 	}
 	if status == 0 {
-		msg := "all upstream proxies failed"
-		if err != nil {
-			msg = err.Error()
-		}
+		// The transport error text can embed the step's URL, including
+		// user:password credentials - log it, never send it to the client.
+		logger.Warn("all upstream proxies failed", "path", r.URL.Path, "err", err)
 		mw.Header().Set("Cache-Control", "no-store")
-		http.Error(mw, msg, http.StatusBadGateway)
+		http.Error(mw, "all upstream proxies failed", http.StatusBadGateway)
 		return
 	}
 	mw.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -756,7 +759,7 @@ func (rt *Router) serveTempFile(mw *metricsResponseWriter, r *http.Request, file
 // the download cache, or "" if the path does not name a module file.
 func contentTypeFor(p string) string {
 	if strings.HasSuffix(p, "/@latest") {
-		return "text/plain; charset=UTF-8"
+		return "application/json" // the @latest file is an info JSON file
 	}
 	_, after, ok := strings.Cut(p, "/@v/")
 	if !ok {
@@ -777,32 +780,31 @@ func contentTypeFor(p string) string {
 	return ""
 }
 
-// serveFromCache serves the cached copy of the module file requested by r.
-// found reports that a cache file exists; served reports that a response
-// was written. When bypassTTL is true, list and @latest files are served
-// even past their cache expiry (cache-only mode: nothing to refetch from).
-func (rt *Router) serveFromCache(mw *metricsResponseWriter, r *http.Request, bypassTTL bool) (found, served bool) {
+// serveFromCache serves the cached copy of the module file requested by r,
+// reporting whether a response was written. When bypassTTL is true, list and
+// @latest files are served even past their cache expiry (cache-only mode:
+// nothing to refetch from).
+func (rt *Router) serveFromCache(mw *metricsResponseWriter, r *http.Request, bypassTTL bool) (served bool) {
 	file := cacheFileFor(rt.downloadRoot, r.URL.Path)
 	f, err := os.Open(file)
 	if err != nil {
-		return false, false
+		return false
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
-		return false, false
+		return false
 	}
-	found = true
 	what := ""
 	if i := strings.Index(r.URL.Path, "/@v/"); i >= 0 {
 		what = r.URL.Path[i+len("/@v/"):]
 	}
 	if !bypassTTL {
 		if strings.HasSuffix(r.URL.Path, "/@latest") && time.Since(info.ModTime()) >= ListExpire {
-			return true, false
+			return false
 		}
 		if what == "list" && time.Since(info.ModTime()) >= rt.cacheExpire {
-			return true, false
+			return false
 		}
 	}
 	if (what == "list" || strings.HasSuffix(r.URL.Path, "/@latest")) && info.Size() == 0 {
@@ -810,19 +812,19 @@ func (rt *Router) serveFromCache(mw *metricsResponseWriter, r *http.Request, byp
 		// the cache TTL): answer 404 from cache, without upstream or go
 		// command.
 		http.Error(mw, "not found", http.StatusNotFound)
-		return true, true
+		return true
 	}
 	ctype := contentTypeFor(r.URL.Path)
 	if ctype == "" {
 		http.Error(mw, "request not recognized", http.StatusNotFound)
-		return true, true
+		return true
 	}
 	mw.Header().Set("Content-Type", ctype)
 	if cc := cacheControlFor(r.URL.Path); cc != "" {
 		mw.Header().Set("Cache-Control", cc)
 	}
 	serveFile(mw, r, "", f, info.ModTime())
-	return true, true
+	return true
 }
 
 // GlobsMatchPath reports whether any path prefix of target

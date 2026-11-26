@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -125,5 +126,26 @@ func TestListNegativeCache(t *testing.T) {
 	}
 	if _, err := new(ops).Latest(context.Background(), mpath); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("fresh empty list file must answer @latest from cache, got %v", err)
+	}
+}
+
+// TestGoJSONTimeout: a hung go command is killed at fetchTimeout, so its
+// goCmdSem slot is released and the proxy cannot stall on dead hosts.
+func TestGoJSONTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh not available")
+	}
+	old := fetchTimeout
+	fetchTimeout = 100 * time.Millisecond
+	defer func() { fetchTimeout = old }()
+	start := time.Now()
+	err := goJSON(nil, "sh", "-c", "sleep 30")
+	if err == nil {
+		t.Fatal("hung command must fail at fetchTimeout")
+	}
+	// Kill at 100ms; cmd.Run returns after WaitDelay (5s) closes the pipes
+	// the sleep child inherited, never the full 30s of the hung command.
+	if d := time.Since(start); d > 15*time.Second {
+		t.Errorf("kill took %v, want fetchTimeout + WaitDelay", d)
 	}
 }

@@ -39,6 +39,15 @@ func (mw *metricsResponseWriter) WriteHeader(code int) {
 	mw.ResponseWriter.WriteHeader(code)
 }
 
+// Write implements http.ResponseWriter; a Write without WriteHeader is an
+// implicit 200 (the http.ServeContent fast path), not status "0".
+func (mw *metricsResponseWriter) Write(p []byte) (int, error) {
+	if mw.statusCode == 0 {
+		mw.statusCode = http.StatusOK
+	}
+	return mw.ResponseWriter.Write(p)
+}
+
 // status returns the status code label.
 func (mw *metricsResponseWriter) status() string {
 	return strconv.Itoa(mw.statusCode)

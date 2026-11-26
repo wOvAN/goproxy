@@ -16,11 +16,9 @@ func TestCacheControlFor(t *testing.T) {
 		{"/github.com/x/y/@v/v1.0.0.info", "public, max-age=604800"},
 		{"/github.com/x/y/@v/v1.0.0.mod", "public, max-age=604800"},
 		{"/github.com/x/y/@v/v1.0.0.zip", "public, max-age=604800"},
-		{"/sumdb/sum.golang.org/supported", "no-store"},
-		{"/sumdb/sum.golang.org/latest", "public, max-age=60"},
-		{"/sumdb/sum.golang.org/tile/0/000", "public, max-age=604800"},
-		{"/sumdb/sum.golang.org/lookup/github.com/x/y", "public, max-age=604800"},
-		{"/sumdb/sum.golang.org", ""},
+		// sumdb Cache-Control is owned by the sumdb handler; cacheControlFor
+		// only knows module paths.
+		{"/sumdb/sum.golang.org/tile/0/000", ""},
 		{"/", ""},
 		{"/notamodule", ""},
 	}

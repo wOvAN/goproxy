@@ -283,6 +283,9 @@ func (h *Handler) writeCache(db, p string, data []byte) {
 	}
 }
 
+// respondSumdb writes an upstream sumdb body with its Cache-Control. The
+// sumdb rules live here (single source): the paths are db-relative and db
+// names can span segments, so proxy.cacheControlFor cannot parse them.
 func respondSumdb(w http.ResponseWriter, status int, p string, data []byte) {
 	switch {
 	case strings.HasPrefix(p, "tile/"), strings.HasPrefix(p, "lookup/"):

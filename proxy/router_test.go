@@ -85,7 +85,7 @@ func TestContentTypeFor(t *testing.T) {
 		path string
 		want string
 	}{
-		{"/github.com/x/y/@latest", "text/plain; charset=UTF-8"},
+		{"/github.com/x/y/@latest", "application/json"},
 		{"/github.com/x/y/@v/list", "text/plain; charset=UTF-8"},
 		{"/github.com/x/y/@v/v1.0.0.info", "application/json"},
 		{"/github.com/x/y/@v/v1.0.0.mod", "text/plain; charset=UTF-8"},
@@ -207,5 +207,34 @@ func TestRouterChainNegativeMarks(t *testing.T) {
 	}
 	if fi, err := os.Stat(filepath.Join(root, "example.com", "a", "b", "@latest")); err != nil || fi.Size() != 0 {
 		t.Errorf("marker file = %v, %v, want empty", fi, err)
+	}
+}
+
+// TestChainFailureHidesUpstreamError: an exhausted chain with transport
+// failures answers 502 with a fixed message, never the transport error text
+// (which embeds the step URL, including user:password credentials).
+func TestChainFailureHidesUpstreamError(t *testing.T) {
+	rt := NewRouter(NewServer(&stubOps{}, nil), &RouterOptions{
+		Proxy:        "http://user:pass@127.0.0.1:1,off",
+		DownloadRoot: t.TempDir(),
+		CacheExpire:  time.Minute,
+	})
+	rec := httptest.NewRecorder()
+	rt.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/example.com/a/b/@v/list", nil))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body := rec.Body.String(); strings.Contains(body, "user:pass") || strings.Contains(body, "127.0.0.1:1") {
+		t.Errorf("502 body leaks the upstream URL/credentials: %q", body)
+	}
+}
+
+func TestMetricsImplicitStatus(t *testing.T) {
+	mw := NewMetricsResponseWriter(httptest.NewRecorder())
+	if _, err := mw.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if got := mw.status(); got != "200" {
+		t.Errorf("status after a Write without WriteHeader = %q, want 200", got)
 	}
 }

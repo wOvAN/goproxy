@@ -68,6 +68,7 @@ var connectTimeout time.Duration
 var fetchTimeout time.Duration
 var tempDir string
 var insecure bool
+var metricsListen string
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
@@ -84,7 +85,7 @@ func setup() {
 	flag.StringVar(&listen, "listen", "0.0.0.0:8081", "service listen address")
 	flag.DurationVar(&cacheExpire, "cacheExpire", 5*time.Minute, "Go Modules cache expiration (min), default is 5 min")
 	flag.BoolVar(&disableModuleFetch, "disableModuleFetch", false, "serve modules and sumdb from the cache only; never fetch upstream")
-	flag.DurationVar(&gcInterval, "gcInterval", 0, "cache garbage collection interval; a cache file untouched for gcKeep is deleted; 0 disables GC")
+	flag.DurationVar(&gcInterval, "gcInterval", 0, "cache garbage collection interval; a cache file untouched for gcKeep is deleted; 0 disables GC; requires atime updates: on noatime mounts it deletes hot cache files")
 	flag.DurationVar(&gcKeep, "gcKeep", 14*24*time.Hour, "cache file age (since last access) to keep during GC")
 	flag.StringVar(&tlsCert, "tlsCert", "", "TLS certificate file; with tlsKey, serve HTTPS")
 	flag.StringVar(&tlsKey, "tlsKey", "", "TLS key file; with tlsCert, serve HTTPS")
@@ -96,6 +97,7 @@ func setup() {
 	flag.StringVar(&tempDir, "tempDir", "", "directory for upstream stream-through temp files; default is $TMPDIR")
 	flag.StringVar(&sumdbCustom, "sumdb", "", `extra proxied checksum databases: "name url,name2 url2" (url optional, defaults to https://name)`)
 	flag.BoolVar(&insecure, "insecure", false, "allow insecure TLS connections to upstream proxies and sumdb mirrors")
+	flag.StringVar(&metricsListen, "metrics", "", "Prometheus /metrics listen address (e.g. :9090); empty disables metrics")
 	var logLevel slog.Level
 	flag.Func("logLevel", "log level: debug, info, warn, error (default info)", func(s string) error {
 		return logLevel.UnmarshalText([]byte(s))
@@ -224,6 +226,22 @@ func main() {
 			logger.Fatal("server failed", err)
 		}
 	}()
+	// Metrics on a dedicated listener: a public proxy must not expose its
+	// traffic counters to anyone who can reach the module port.
+	var metricsSrv *http.Server
+	if metricsListen != "" {
+		metricsSrv = &http.Server{
+			Addr:              metricsListen,
+			Handler:           promhttp.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			logger.Info("metrics", "listen", metricsListen)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Fatal("metrics server failed", err)
+			}
+		}()
+	}
 	if gcInterval > 0 {
 		go runCacheGC()
 	}
@@ -237,6 +255,9 @@ func main() {
 	err := server.Shutdown(ctx)
 	if err != nil {
 		logger.Fatal("error while shutting down the server", err)
+	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(ctx)
 	}
 	logger.Info("successful server shutdown")
 }
@@ -284,10 +305,21 @@ func mapNotFound(err error) error {
 }
 
 // goJSON runs the go command and parses its JSON output into dst.
+// The subprocess is bound to fetchTimeout (0: no limit), not the client's
+// request context, because doOnce shares one run with all waiting clients.
 func goJSON(dst any, command ...string) error {
 	goCmdSem <- struct{}{}
 	defer func() { <-goCmdSem }()
-	cmd := exec.Command(command[0], command[1:]...)
+	ctx := context.Background()
+	if fetchTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, fetchTimeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	// After the context kills the go command, a grandchild (git) can keep
+	// the stdout/stderr pipes open; WaitDelay closes them 5s after the kill.
+	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -317,13 +349,6 @@ func (r *responseLogger) WriteHeader(code int) {
 
 // ServeHTTP implements http handler.
 func (l *requestLogger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-
-	// Prometheus metrics
-	if r.URL.Path == "/metrics" {
-		promhttp.Handler().ServeHTTP(w, r)
-		return
-	}
-
 	start := time.Now()
 	rl := &responseLogger{code: 200, ResponseWriter: w}
 	l.h.ServeHTTP(rl, r)
